@@ -92,5 +92,44 @@ def process_single_pdf(file_bytes, filename, client):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     for sheet, rows in bank_groups.items():
-                        pd.
-    
+                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+                excel_bytes = output.getvalue()
+        except Exception as e:
+            st.warning(f"Error processing {filename}: {str(e)}")
+
+    return base_name, cut_pdf_bytes, excel_bytes
+
+uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
+
+if uploaded_files and st.button("Start Processing"):
+    if not api_key:
+        st.error("Please enter your Gemini API Key in the sidebar!")
+    else:
+        client = genai.Client(api_key=api_key)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        zip_buffer = io.BytesIO()
+        total = len(uploaded_files)
+        
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            for idx, file in enumerate(uploaded_files):
+                status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
+                file_data = file.getvalue()
+                base, cut_pdf, excel_data = process_single_pdf(file_data, file.name, client)
+                
+                if cut_pdf:
+                    zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
+                if excel_data:
+                    zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
+                
+                progress_bar.progress((idx + 1) / total)
+
+        status_text.success("All PDFs Processed Successfully!")
+        st.download_button(
+            label="📥 Download All Deliverables (ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name="Processed_Auctions.zip",
+            mime="application/zip"
+                    )
+        
