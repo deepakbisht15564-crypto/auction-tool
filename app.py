@@ -65,7 +65,7 @@ def process_single_pdf(file_bytes, filename, client):
         
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -73,7 +73,6 @@ def process_single_pdf(file_bytes, filename, client):
                 )
             )
             raw_json = response.text.strip()
-            # Clean possible markdown wrap
             if raw_json.startswith("```json"):
                 raw_json = raw_json[7:-3].strip()
             elif raw_json.startswith("```"):
@@ -146,5 +145,4 @@ if uploaded_files and st.button("Start Processing"):
             data=zip_buffer.getvalue(),
             file_name="Processed_Auctions.zip",
             mime="application/zip"
-)
-        
+        )
