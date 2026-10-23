@@ -4,7 +4,6 @@ import re
 import json
 import zipfile
 import io
-import time
 import fitz  # PyMuPDF
 import pandas as pd
 from google import genai
@@ -19,23 +18,10 @@ api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 def clean_text(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', str(text))
 
-def get_best_model(client):
-    try:
-        models = [m.name for m in client.models.list()]
-        # Preferred order
-        for target in ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
-            for m in models:
-                if target in m:
-                    return m.replace("models/", "")
-        if models:
-            return models[0].replace("models/", "")
-    except Exception:
-        pass
-    return "gemini-3.8-flash"
-
-def process_single_pdf(file_bytes, filename, client, model_name):
+def process_single_pdf(file_bytes, filename, client):
     base_name = os.path.splitext(filename)[0]
     
+    # 1. Cutting logic
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     cut_doc = fitz.open()
     keywords = ["e-auction", "sale notice", "sarfaesi", "reserve price", "emd", "auction", "possession"]
@@ -58,93 +44,77 @@ def process_single_pdf(file_bytes, filename, client, model_name):
     excel_bytes = None
     all_rows = []
 
+    # 2. AI Extraction
     if full_text.strip():
         prompt = f"""
-        You are a financial data extraction expert.
-        Extract all E-Auction Sale Notices from the following text into a clean JSON list.
-        Each notice in the list must have these exact keys:
-        - "bank_or_arc_name": Bank or ARC name (e.g. SBI, HDFC, Arcil)
-        - "s_no": Serial number
-        - "account_prospect_no": Account or Prospect number
-        - "borrower_name": Borrower(s) name
-        - "property_description": Property details (clean text)
-        - "reserve_price": Reserve Price
-        - "emd_amount": EMD Amount
-        - "inspection_date_time": Inspection Date & Time
-        - "emd_last_date_time": EMD Last Date & Time
-        - "auction_date_time": Auction Date & Time
+Extract all E-Auction Sale Notices from the text into a clean JSON array.
+Keys for each object:
+- "bank_or_arc_name"
+- "s_no"
+- "account_prospect_no"
+- "borrower_name"
+- "property_description"
+- "reserve_price"
+- "emd_amount"
+- "inspection_date_time"
+- "emd_last_date_time"
+- "auction_date_time"
 
-        Return ONLY a JSON array of objects: [{{"bank_or_arc_name": "...", ...}}]
+Return ONLY raw JSON list of objects: [{{"bank_or_arc_name": "...", ...}}]
 
-        Text:
-        {full_text[:40000]}
-        """
-        
-        raw_json = None
-        last_err = ""
-
-        # Retry loop for 503 high demand traffic spikes
-        for attempt in range(4):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1
-                    )
+Text:
+{full_text[:35000]}
+"""
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
                 )
-                if response and response.text:
-                    raw_json = response.text.strip()
-                    break
-            except Exception as e:
-                last_err = str(e)
-                time.sleep(3 * (attempt + 1))
+            )
+            raw_json = response.text.strip() if response and response.text else ""
+            if raw_json.startswith("```json"):
+                raw_json = raw_json[7:-3].strip()
+            elif raw_json.startswith("```"):
+                raw_json = raw_json[3:-3].strip()
 
-        if raw_json:
-            try:
-                if raw_json.startswith("```json"):
-                    raw_json = raw_json[7:-3].strip()
-                elif raw_json.startswith("```"):
-                    raw_json = raw_json[3:-3].strip()
+            data = json.loads(raw_json)
+            if isinstance(data, dict) and "notices" in data:
+                data = data["notices"]
+            elif not isinstance(data, list):
+                data = [data]
 
-                data = json.loads(raw_json)
-                if isinstance(data, dict) and "notices" in data:
-                    data = data["notices"]
-                elif not isinstance(data, list):
-                    data = [data]
+            if data:
+                bank_groups = {}
+                for item in data:
+                    bank = item.get("bank_or_arc_name", "Others") or "Others"
+                    bank = str(bank).strip().upper()
+                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
+                    row = {
+                        "Notice File": filename,
+                        "Bank / ARC": bank,
+                        "S.No.": item.get("s_no", ""),
+                        "Account / Prospect No.": item.get("account_prospect_no", ""),
+                        "Borrower(s) Name": item.get("borrower_name", ""),
+                        "Property Description": clean_text(item.get("property_description", "")),
+                        "Reserve Price": item.get("reserve_price", ""),
+                        "EMD Amount": item.get("emd_amount", ""),
+                        "Inspection Date & Time": item.get("inspection_date_time", ""),
+                        "EMD Last Date & Time": item.get("emd_last_date_time", ""),
+                        "Auction Date & Time": item.get("auction_date_time", "")
+                    }
+                    bank_groups.setdefault(sheet_name, []).append(row)
+                    all_rows.append(row)
 
-                if data:
-                    bank_groups = {}
-                    for item in data:
-                        bank = item.get("bank_or_arc_name", "Others") or "Others"
-                        bank = str(bank).strip().upper()
-                        sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
-                        row = {
-                            "Notice File": filename,
-                            "Bank / ARC": bank,
-                            "S.No.": item.get("s_no", ""),
-                            "Account / Prospect No.": item.get("account_prospect_no", ""),
-                            "Borrower(s) Name": item.get("borrower_name", ""),
-                            "Property Description": clean_text(item.get("property_description", "")),
-                            "Reserve Price": item.get("reserve_price", ""),
-                            "EMD Amount": item.get("emd_amount", ""),
-                            "Inspection Date & Time": item.get("inspection_date_time", ""),
-                            "EMD Last Date & Time": item.get("emd_last_date_time", ""),
-                            "Auction Date & Time": item.get("auction_date_time", "")
-                        }
-                        bank_groups.setdefault(sheet_name, []).append(row)
-                        all_rows.append(row)
-
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        for sheet, rows in bank_groups.items():
-                            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
-                    excel_bytes = output.getvalue()
-            except Exception as e:
-                st.error(f"Data format error on {filename}: {str(e)}")
-        else:
-            st.error(f"Server busy: {last_err}")
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    for sheet, rows in bank_groups.items():
+                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+                excel_bytes = output.getvalue()
+        except Exception as e:
+            st.warning(f"Error on {filename}: {str(e)}")
 
     return base_name, cut_pdf_bytes, excel_bytes, all_rows
 
@@ -155,8 +125,6 @@ if uploaded_files and st.button("Start Processing"):
         st.error("Please enter your Gemini API Key in the sidebar!")
     else:
         client = genai.Client(api_key=api_key)
-        active_model = get_best_model(client)
-        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -168,7 +136,7 @@ if uploaded_files and st.button("Start Processing"):
             for idx, file in enumerate(uploaded_files):
                 status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
                 file_data = file.getvalue()
-                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, client, active_model)
+                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, client)
                 
                 if cut_pdf:
                     zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
@@ -179,15 +147,15 @@ if uploaded_files and st.button("Start Processing"):
                 
                 progress_bar.progress((idx + 1) / total)
 
-            # Master file for CRM automation
             if master_rows:
                 master_df = pd.DataFrame(master_rows)
                 zip_file.writestr("CRM_All_Accounts_Master.csv", master_df.to_csv(index=False).encode('utf-8'))
 
-        status_text.success("All PDFs Processed Successfully!")
+        status_text.success("Processing Complete!")
         st.download_button(
             label="📥 Download All Deliverables (ZIP)",
             data=zip_buffer.getvalue(),
             file_name="Processed_Auctions.zip",
             mime="application/zip"
         )
+        
