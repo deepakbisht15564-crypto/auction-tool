@@ -64,30 +64,26 @@ def process_single_pdf(file_bytes, filename, client):
         {full_text[:45000]}
         """
         
-        models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
         raw_json = None
         last_err = ""
 
-        # Auto retry logic for 503 high demand spikes
-        for m in models_to_try:
-            for attempt in range(3):
-                try:
-                    response = client.models.generate_content(
-                        model=m,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1
-                        )
+        # Only gemini-3.8-flash, no old models
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1
                     )
-                    if response and response.text:
-                        raw_json = response.text.strip()
-                        break
-                except Exception as e:
-                    last_err = str(e)
-                    time.sleep(2)  # Wait 2 seconds before retry
-            if raw_json:
-                break
+                )
+                if response and response.text:
+                    raw_json = response.text.strip()
+                    break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(2)
 
         if raw_json:
             try:
@@ -129,7 +125,7 @@ def process_single_pdf(file_bytes, filename, client):
             except Exception as e:
                 st.error(f"Data format error on {filename}: {str(e)}")
         else:
-            st.error(f"API busy or error on {filename}: {last_err}")
+            st.error(f"API Error on {filename}: {last_err}")
 
     return base_name, cut_pdf_bytes, excel_bytes
 
