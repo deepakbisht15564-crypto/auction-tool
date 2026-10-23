@@ -4,6 +4,7 @@ import re
 import json
 import zipfile
 import io
+import time
 import fitz  # PyMuPDF
 import pandas as pd
 from google import genai
@@ -63,53 +64,72 @@ def process_single_pdf(file_bytes, filename, client):
         {full_text[:45000]}
         """
         
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1
-                )
-            )
-            raw_json = response.text.strip()
-            if raw_json.startswith("```json"):
-                raw_json = raw_json[7:-3].strip()
-            elif raw_json.startswith("```"):
-                raw_json = raw_json[3:-3].strip()
+        models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+        raw_json = None
+        last_err = ""
 
-            data = json.loads(raw_json)
-            if isinstance(data, dict) and "notices" in data:
-                data = data["notices"]
-            elif not isinstance(data, list):
-                data = [data]
+        # Auto retry logic for 503 high demand spikes
+        for m in models_to_try:
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1
+                        )
+                    )
+                    if response and response.text:
+                        raw_json = response.text.strip()
+                        break
+                except Exception as e:
+                    last_err = str(e)
+                    time.sleep(2)  # Wait 2 seconds before retry
+            if raw_json:
+                break
 
-            if data:
-                bank_groups = {}
-                for item in data:
-                    bank = item.get("bank_or_arc_name", "Others") or "Others"
-                    bank = str(bank).strip().upper()
-                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
-                    row = {
-                        "S.No.": item.get("s_no", ""),
-                        "Account / Prospect No.": item.get("account_prospect_no", ""),
-                        "Borrower(s) Name": item.get("borrower_name", ""),
-                        "Property Description": clean_text(item.get("property_description", "")),
-                        "Reserve Price": item.get("reserve_price", ""),
-                        "EMD Amount": item.get("emd_amount", ""),
-                        "Inspection Date & Time": item.get("inspection_date_time", ""),
-                        "EMD Last Date & Time": item.get("emd_last_date_time", ""),
-                        "Auction Date & Time": item.get("auction_date_time", "")
-                    }
-                    bank_groups.setdefault(sheet_name, []).append(row)
+        if raw_json:
+            try:
+                if raw_json.startswith("```json"):
+                    raw_json = raw_json[7:-3].strip()
+                elif raw_json.startswith("```"):
+                    raw_json = raw_json[3:-3].strip()
 
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    for sheet, rows in bank_groups.items():
-                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
-                excel_bytes = output.getvalue()
-        except Exception as e:
-            st.error(f"API Error on {filename}: {str(e)}")
+                data = json.loads(raw_json)
+                if isinstance(data, dict) and "notices" in data:
+                    data = data["notices"]
+                elif not isinstance(data, list):
+                    data = [data]
+
+                if data:
+                    bank_groups = {}
+                    for item in data:
+                        bank = item.get("bank_or_arc_name", "Others") or "Others"
+                        bank = str(bank).strip().upper()
+                        sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
+                        row = {
+                            "S.No.": item.get("s_no", ""),
+                            "Account / Prospect No.": item.get("account_prospect_no", ""),
+                            "Borrower(s) Name": item.get("borrower_name", ""),
+                            "Property Description": clean_text(item.get("property_description", "")),
+                            "Reserve Price": item.get("reserve_price", ""),
+                            "EMD Amount": item.get("emd_amount", ""),
+                            "Inspection Date & Time": item.get("inspection_date_time", ""),
+                            "EMD Last Date & Time": item.get("emd_last_date_time", ""),
+                            "Auction Date & Time": item.get("auction_date_time", "")
+                        }
+                        bank_groups.setdefault(sheet_name, []).append(row)
+
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        for sheet, rows in bank_groups.items():
+                            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+                    excel_bytes = output.getvalue()
+            except Exception as e:
+                st.error(f"Data format error on {filename}: {str(e)}")
+        else:
+            st.error(f"API busy or error on {filename}: {last_err}")
 
     return base_name, cut_pdf_bytes, excel_bytes
 
