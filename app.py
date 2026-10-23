@@ -19,7 +19,21 @@ api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 def clean_text(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', str(text))
 
-def process_single_pdf(file_bytes, filename, client):
+def get_best_model(client):
+    try:
+        models = [m.name for m in client.models.list()]
+        # Preferred order
+        for target in ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash"]:
+            for m in models:
+                if target in m:
+                    return m.replace("models/", "")
+        if models:
+            return models[0].replace("models/", "")
+    except Exception:
+        pass
+    return "gemini-3.8-flash"
+
+def process_single_pdf(file_bytes, filename, client, model_name):
     base_name = os.path.splitext(filename)[0]
     
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -42,6 +56,8 @@ def process_single_pdf(file_bytes, filename, client):
     doc.close()
 
     excel_bytes = None
+    all_rows = []
+
     if full_text.strip():
         prompt = f"""
         You are a financial data extraction expert.
@@ -61,17 +77,17 @@ def process_single_pdf(file_bytes, filename, client):
         Return ONLY a JSON array of objects: [{{"bank_or_arc_name": "...", ...}}]
 
         Text:
-        {full_text[:45000]}
+        {full_text[:40000]}
         """
         
         raw_json = None
         last_err = ""
 
-        # Only gemini-3.8-flash, no old models
-        for attempt in range(3):
+        # Retry loop for 503 high demand traffic spikes
+        for attempt in range(4):
             try:
                 response = client.models.generate_content(
-                    model="gemini-3.8-flash",
+                    model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -83,7 +99,7 @@ def process_single_pdf(file_bytes, filename, client):
                     break
             except Exception as e:
                 last_err = str(e)
-                time.sleep(2)
+                time.sleep(3 * (attempt + 1))
 
         if raw_json:
             try:
@@ -105,6 +121,8 @@ def process_single_pdf(file_bytes, filename, client):
                         bank = str(bank).strip().upper()
                         sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
                         row = {
+                            "Notice File": filename,
+                            "Bank / ARC": bank,
                             "S.No.": item.get("s_no", ""),
                             "Account / Prospect No.": item.get("account_prospect_no", ""),
                             "Borrower(s) Name": item.get("borrower_name", ""),
@@ -116,6 +134,7 @@ def process_single_pdf(file_bytes, filename, client):
                             "Auction Date & Time": item.get("auction_date_time", "")
                         }
                         bank_groups.setdefault(sheet_name, []).append(row)
+                        all_rows.append(row)
 
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -125,9 +144,9 @@ def process_single_pdf(file_bytes, filename, client):
             except Exception as e:
                 st.error(f"Data format error on {filename}: {str(e)}")
         else:
-            st.error(f"API Error on {filename}: {last_err}")
+            st.error(f"Server busy: {last_err}")
 
-    return base_name, cut_pdf_bytes, excel_bytes
+    return base_name, cut_pdf_bytes, excel_bytes, all_rows
 
 uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 
@@ -136,24 +155,34 @@ if uploaded_files and st.button("Start Processing"):
         st.error("Please enter your Gemini API Key in the sidebar!")
     else:
         client = genai.Client(api_key=api_key)
+        active_model = get_best_model(client)
+        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         zip_buffer = io.BytesIO()
         total = len(uploaded_files)
+        master_rows = []
         
         with zipfile.ZipFile(zip_buffer, "w") as zip_file:
             for idx, file in enumerate(uploaded_files):
                 status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
                 file_data = file.getvalue()
-                base, cut_pdf, excel_data = process_single_pdf(file_data, file.name, client)
+                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, client, active_model)
                 
                 if cut_pdf:
                     zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
                 if excel_data:
                     zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
+                if rows:
+                    master_rows.extend(rows)
                 
                 progress_bar.progress((idx + 1) / total)
+
+            # Master file for CRM automation
+            if master_rows:
+                master_df = pd.DataFrame(master_rows)
+                zip_file.writestr("CRM_All_Accounts_Master.csv", master_df.to_csv(index=False).encode('utf-8'))
 
         status_text.success("All PDFs Processed Successfully!")
         st.download_button(
