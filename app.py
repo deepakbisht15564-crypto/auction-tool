@@ -59,43 +59,56 @@ def process_single_pdf(file_bytes, filename, client):
     excel_bytes = None
     if full_text.strip():
         prompt = "Extract all E-Auction Sale Notices published by any Bank or ARC. Keep property description clean (only '.' and ',' allowed)."
-        try:
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[prompt, full_text[:40000]],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AuctionList,
-                    temperature=0.1
+        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]
+        response = None
+        
+        for model_name in models_to_try:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, full_text[:40000]],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=AuctionList,
+                        temperature=0.1
+                    )
                 )
-            )
-            data = json.loads(response.text).get("notices", [])
-            if data:
-                bank_groups = {}
-                for item in data:
-                    bank = item.get("bank_or_arc_name", "Others") or "Others"
-                    bank = str(bank).strip().upper()
-                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
-                    row = {
-                        "S.No.": item.get("s_no"),
-                        "Account / Prospect No.": item.get("account_prospect_no"),
-                        "Borrower(s) Name": item.get("borrower_name"),
-                        "Property Description": clean_text(item.get("property_description", "")),
-                        "Reserve Price": item.get("reserve_price"),
-                        "EMD Amount": item.get("emd_amount"),
-                        "Inspection Date & Time": item.get("inspection_date_time"),
-                        "EMD Last Date & Time": item.get("emd_last_date_time"),
-                        "Auction Date & Time": item.get("auction_date_time")
-                    }
-                    bank_groups.setdefault(sheet_name, []).append(row)
+                if response and response.text:
+                    break
+            except Exception:
+                continue
 
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    for sheet, rows in bank_groups.items():
-                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
-                excel_bytes = output.getvalue()
-        except Exception as e:
-            st.warning(f"Error processing {filename}: {str(e)}")
+        if response and response.text:
+            try:
+                data = json.loads(response.text).get("notices", [])
+                if data:
+                    bank_groups = {}
+                    for item in data:
+                        bank = item.get("bank_or_arc_name", "Others") or "Others"
+                        bank = str(bank).strip().upper()
+                        sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
+                        row = {
+                            "S.No.": item.get("s_no"),
+                            "Account / Prospect No.": item.get("account_prospect_no"),
+                            "Borrower(s) Name": item.get("borrower_name"),
+                            "Property Description": clean_text(item.get("property_description", "")),
+                            "Reserve Price": item.get("reserve_price"),
+                            "EMD Amount": item.get("emd_amount"),
+                            "Inspection Date & Time": item.get("inspection_date_time"),
+                            "EMD Last Date & Time": item.get("emd_last_date_time"),
+                            "Auction Date & Time": item.get("auction_date_time")
+                        }
+                        bank_groups.setdefault(sheet_name, []).append(row)
+
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        for sheet, rows in bank_groups.items():
+                            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+                    excel_bytes = output.getvalue()
+            except Exception as e:
+                st.warning(f"Error parsing data for {filename}: {str(e)}")
+        else:
+            st.warning(f"Could not extract data for {filename} with available models.")
 
     return base_name, cut_pdf_bytes, excel_bytes
 
@@ -131,5 +144,5 @@ if uploaded_files and st.button("Start Processing"):
             data=zip_buffer.getvalue(),
             file_name="Processed_Auctions.zip",
             mime="application/zip"
-                    )
+        )
         
