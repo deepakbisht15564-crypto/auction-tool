@@ -32,14 +32,14 @@ class AuctionList(BaseModel):
     notices: list[AuctionNotice]
 
 def clean_text(text: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', text)
+    return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', str(text))
 
 def process_single_pdf(file_bytes, filename, client):
     base_name = os.path.splitext(filename)[0]
     
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     cut_doc = fitz.open()
-    keywords = ["e-auction", "sale notice", "sarfaesi", "reserve price", "emd"]
+    keywords = ["e-auction", "sale notice", "sarfaesi", "reserve price", "emd", "auction", "possession"]
     full_text = ""
 
     for page_num in range(len(doc)):
@@ -49,9 +49,10 @@ def process_single_pdf(file_bytes, filename, client):
         if any(kw in txt.lower() for kw in keywords):
             cut_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
 
-    cut_pdf_bytes = None
-    if len(cut_doc) > 0:
-        cut_pdf_bytes = cut_doc.write()
+    if len(cut_doc) == 0 and len(doc) > 0:
+        cut_doc.insert_pdf(doc)
+
+    cut_pdf_bytes = cut_doc.write()
     cut_doc.close()
     doc.close()
 
@@ -61,7 +62,7 @@ def process_single_pdf(file_bytes, filename, client):
         try:
             response = client.models.generate_content(
                 model="gemini-1.5-flash",
-                contents=[prompt, full_text],
+                contents=[prompt, full_text[:40000]],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=AuctionList,
@@ -72,8 +73,9 @@ def process_single_pdf(file_bytes, filename, client):
             if data:
                 bank_groups = {}
                 for item in data:
-                    bank = item.get("bank_or_arc_name", "Others").strip().upper()
-                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30]
+                    bank = item.get("bank_or_arc_name", "Others") or "Others"
+                    bank = str(bank).strip().upper()
+                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
                     row = {
                         "S.No.": item.get("s_no"),
                         "Account / Prospect No.": item.get("account_prospect_no"),
@@ -90,42 +92,5 @@ def process_single_pdf(file_bytes, filename, client):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     for sheet, rows in bank_groups.items():
-                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
-                excel_bytes = output.getvalue()
-        except Exception:
-            pass
-
-    return base_name, cut_pdf_bytes, excel_bytes
-
-uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
-
-if uploaded_files and st.button("Start Processing"):
-    if not api_key:
-        st.error("Please enter your Gemini API Key in the sidebar!")
-    else:
-        client = genai.Client(api_key=api_key)
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        zip_buffer = io.BytesIO()
-        total = len(uploaded_files)
-        
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            for idx, file in enumerate(uploaded_files):
-                status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
-                base, cut_pdf, excel_data = process_single_pdf(file.read(), file.name, client)
-                
-                if cut_pdf:
-                    zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
-                if excel_data:
-                    zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
-                
-                progress_bar.progress((idx + 1) / total)
-
-        status_text.success("All PDFs Processed Successfully!")
-        st.download_button(
-            label="📥 Download All Deliverables (ZIP)",
-            data=zip_buffer.getvalue(),
-            file_name="Processed_Auctions.zip",
-            mime="application/zip"
-        )
+                        pd.
+    
