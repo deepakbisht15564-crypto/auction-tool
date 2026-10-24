@@ -72,7 +72,7 @@ def process_single_pdf(file_bytes, filename, groq_client):
     cut_pdf_bytes = cut_doc.write()
     cut_doc.close()
 
-    # 2. Fast AI Extraction via Groq (Standard Model: llama3-8b-8192)
+    # 2. Fast AI Extraction via Groq (Active Model: llama-3.1-8b-instant)
     excel_bytes = None
     all_rows = []
 
@@ -104,7 +104,7 @@ Text:
                     {"role": "system", "content": "You return only pure valid JSON arrays with no markdown formatting tags."},
                     {"role": "user", "content": prompt}
                 ],
-                model="llama3-8b-8192",
+                model="llama-3.1-8b-instant",
                 temperature=0.1
             )
             raw_json = chat_completion.choices[0].message.content.strip()
