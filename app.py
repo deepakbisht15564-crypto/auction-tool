@@ -39,11 +39,11 @@ def extract_bank_name(lines, full_text):
         u = line.upper()
         if "ARCIL" in u or "ASSET RECONSTRUCTION" in u:
             return "ARCIL"
-        elif "STATE BANK OF INDIA" in u or "SBI" in u:
+        elif "STATE BANK" in u or "SBI" in u:
             return "STATE BANK OF INDIA"
-        elif "CANARA BANK" in u:
+        elif "CANARA" in u:
             return "CANARA BANK"
-        elif "PUNJAB NATIONAL BANK" in u or "PNB" in u:
+        elif "PUNJAB NATIONAL" in u or "PNB" in u:
             return "PUNJAB NATIONAL BANK"
         elif "BANK OF BARODA" in u or "BOB" in u:
             return "BANK OF BARODA"
@@ -51,19 +51,21 @@ def extract_bank_name(lines, full_text):
             return "INDIAN BANK"
         elif "UNION BANK" in u:
             return "UNION BANK OF INDIA"
-        elif "HDFC BANK" in u:
+        elif "HDFC" in u:
             return "HDFC BANK"
-        elif "ICICI BANK" in u:
+        elif "ICICI" in u:
             return "ICICI BANK"
-        elif "AXIS BANK" in u:
+        elif "AXIS" in u:
             return "AXIS BANK"
-        elif "KOTAK MAHINDRA" in u:
+        elif "KOTAK" in u:
             return "KOTAK MAHINDRA BANK"
         elif "BANK" in u:
-            candidate = u.split("BRANCH")[0].split("NOTICE")[0].strip()
-            if len(candidate) > 4:
-                return candidate
-    return "ARCIL" if "arcil" in full_text.lower() else "BANK NOTICE"
+            cand = u.split("BRANCH")[0].split("NOTICE")[0].strip()
+            if len(cand) > 4:
+                return cand
+    if "arcil" in full_text.lower():
+        return "ARCIL"
+    return "BANK NOTICE"
 
 def extract_borrower(filename, lines):
     clean_fn = filename.replace("_Cutting", "").replace(".pdf", "")
@@ -75,5 +77,174 @@ def extract_borrower(filename, lines):
         return b_name.replace("MrMrs.", "").replace("Mr.", "").replace("Mrs.", "").strip()
 
     for idx, line in enumerate(lines):
-        if "borrower"
+        line_low = line.lower()
+        if "borrower" in line_low:
+            parts = line.split(":")
+            val = parts[-1].split("/")[0].split("Co-")[0].strip()
+            if len(val) > 2:
+                return clean_val(val)
+            elif idx + 1 < len(lines):
+                return clean_val(lines[idx + 1])
+    return "N/A"
+
+def style_excel_worksheet(ws):
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    
+    thin_side = Side(border_style="thin", color="D9D9D9")
+    border_box = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    ws.row_dimensions[1].height = 28
+    for col_idx in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        cell.border = border_box
+
+    for row_idx in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 50
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = Font(name="Calibri", size=10)
+            cell.alignment = left_align
+            cell.border = border_box
+
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            val_str = str(cell.value or "")
+            if len(val_str) > max_len:
+                max_len = len(val_str)
+        adjusted_width = min(max(max_len + 4, 15), 45)
+        ws.column_dimensions[col_letter].width = adjusted_width
+
+def parse_notice_document(doc, filename):
+    t_idx = 0
+    for idx in range(len(doc)):
+        txt = doc[idx].get_text().lower()
+        if any(w in txt for w in ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price"]):
+            t_idx = idx
+            break
+
+    target_page = doc[t_idx]
+
+    full_rect = target_page.rect
+    target_page.set_cropbox(full_rect)
+    target_page.set_mediabox(full_rect)
+
+    full_doc = fitz.open()
+    full_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
+    full_doc[0].set_cropbox(full_rect)
+    full_doc[0].set_mediabox(full_rect)
+    pdf_bytes = full_doc.write()
+    full_doc.close()
+
+    full_text = target_page.get_text()
+    lines = [clean_val(l) for l in full_text.split("\n") if clean_val(l)]
+
+    bank_name = extract_bank_name(lines, full_text).upper()
+    borrower = extract_borrower(filename, lines)
+
+    amounts = re.findall(r'(?:Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)', full_text, re.I)
+    if not amounts:
+        amounts = re.findall(r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b', full_text)
+
+    reserve_price = f"Rs. {clean_val(amounts[0])}" if len(amounts) >= 1 else ""
+    emd_amount = f"Rs. {clean_val(amounts[1])}" if len(amounts) >= 2 else ""
+
+    dates = re.findall(r'\b\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}\b', full_text)
+    times = re.findall(r'\b\d{1,2}[:\.]\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.|hrs|hours)?\b', full_text, re.I)
+
+    emd_last_date = dates[0] if len(dates) > 0 else ""
+    auction_date = dates[1] if len(dates) > 1 else emd_last_date
+
+    emd_last_time = clean_val(times[0]) if len(times) > 0 else "05:00 PM"
+    auction_time = clean_val(times[1]) if len(times) > 1 else "11:00 AM - 12:00 PM"
+
+    prop_desc = ""
+    for idx, line in enumerate(lines):
+        line_l = line.lower()
+        if any(kw in line_l for kw in ["property", "schedule", "immovable", "piece and parcel", "boundaries"]):
+            prop_desc = " ".join(lines[idx:idx+5])
+            break
+    if not prop_desc:
+        mid = len(lines) // 2
+        prop_desc = " ".join(lines[mid:mid+4]) if lines else "Details as per attached notice."
+
+    acct_match = re.findall(r'\b[A-Z0-9]{8,20}\b', filename)
+    acct_no = acct_match[0] if acct_match else ""
+
+    row_data = {
+        "S.No.": 1,
+        "Bank / ARC": bank_name,
+        "Account / Prospect No.": acct_no,
+        "Borrower(s) Name": borrower,
+        "Property Description": clean_prop(prop_desc),
+        "Reserve Price": reserve_price,
+        "EMD Amount": emd_amount,
+        "Inspection Date & Time": "As per notice terms",
+        "EMD Last Date & Time": f"{emd_last_date} {emd_last_time}".strip(),
+        "Auction Date & Time": f"{auction_date} {auction_time}".strip()
+    }
+
+    clean_sheet = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30].strip() or "NOTICE DATA"
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        pd.DataFrame([row_data]).to_excel(writer, sheet_name=clean_sheet, index=False)
+        ws = writer.sheets[clean_sheet]
+        style_excel_worksheet(ws)
+
+    excel_bytes = out.getvalue()
+    master_row = dict(row_data)
+    master_row["Source_File"] = filename
+
+    return pdf_bytes, excel_bytes, [master_row]
+
+if start_btn:
+    if not uploaded_files:
+        st.warning("Please upload auction PDF files!")
+    else:
+        prog = st.progress(0)
+        status = st.empty()
+
+        zip_buf = io.BytesIO()
+        total = len(uploaded_files)
+        all_master = []
+
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            for i, f in enumerate(uploaded_files):
+                status.text(f"Processing ({i+1}/{total}): {f.name}")
+                base = os.path.splitext(f.name)[0]
+                doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+
+                p_pdf, x_data, m_rows = parse_notice_document(doc, f.name)
+                doc.close()
+
+                if p_pdf:
+                    zf.writestr(f"{base}/{base}_Complete_Page.pdf", p_pdf)
+                if x_data:
+                    zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
+                if m_rows:
+                    all_master.extend(m_rows)
+
+                prog.progress((i + 1) / total)
+
+            if all_master:
+                m_df = pd.DataFrame(all_master)
+                zf.writestr(
+                    "CRM_All_Accounts_Master.csv",
+                    m_df.to_csv(index=False).encode('utf-8')
+                )
+
+        status.success("All Done!")
+        st.download_button(
+            label="Download All Deliverables (ZIP)",
+            data=zip_buf.getvalue(),
+            file_name="Processed_Auctions.zip",
+            mime="application/zip"
+    )
         
