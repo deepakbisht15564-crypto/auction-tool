@@ -3,12 +3,12 @@ import os
 import re
 import zipfile
 import io
-import fitz
+import fitz  # PyMuPDF
 import pandas as pd
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("Bulk E-Auction PDF Processor")
-st.write("Clean Box Cuttings + Field-Wise Excel Extraction.")
+st.write("Full Page High-Res Output + Structured Excel Data Extraction.")
 
 uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 start_btn = st.button("Start Processing")
@@ -19,59 +19,13 @@ def clean_val(text):
     val = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', str(text))
     return " ".join(val.split()).strip()
 
-def get_precise_notice_box(page):
-    # Notice identify karne wale primary anchors
-    top_anchors = ["arcil", "asset reconstruction", "sale notice", "e-auction notice", "sarfaesi"]
-    bottom_anchors = ["authorised officer", "terms and conditions", "arcil.co.in", "possession", "reserve price"]
-
-    top_rects = []
-    for t in top_anchors:
-        found = page.search_for(t)
-        if found:
-            top_rects.extend(found)
-
-    bottom_rects = []
-    for b in bottom_anchors:
-        found = page.search_for(b)
-        if found:
-            bottom_rects.extend(found)
-
-    if top_rects:
-        # Notice box ka starting top coordinate
-        y_start = min(r.y0 for r in top_rects) - 25
-        x_start = min(r.x0 for r in top_rects) - 15
-
-        if bottom_rects:
-            # Notice box ke bottom/right coordinates
-            valid_bottoms = [r for r in bottom_rects if r.y1 > y_start]
-            if valid_bottoms:
-                y_end = max(r.y1 for r in valid_bottoms) + 30
-                x_end = max(r.x1 for r in valid_bottoms) + 20
-            else:
-                y_end = page.rect.height
-                x_end = page.rect.width
-        else:
-            y_end = page.rect.height
-            x_end = page.rect.width
-
-        # Strictly notice boundary (prevents left/top ad clippings)
-        return fitz.Rect(
-            max(0, x_start),
-            max(0, y_start),
-            min(page.rect.width, max(x_end, x_start + 250)),
-            min(page.rect.height, y_end)
-        )
-
-    # Fallback agar text coordinates match na ho
-    return fitz.Rect(page.rect.width * 0.35, page.rect.height * 0.45, page.rect.width, page.rect.height)
-
-def parse_notice_data(full_text, filename):
-    lines = [clean_val(l) for l in full_text.split("\n")]
-    lines = [l for l in lines if l]
+def parse_notice_data(page, filename):
+    full_text = page.get_text()
+    lines = [clean_val(l) for l in full_text.split("\n") if clean_val(l)]
 
     # 1. Exact Bank / ARC Name Detection
     bank_name = ""
-    for line in lines[:25]:
+    for line in lines[:30]:
         u = line.upper()
         if "ARCIL" in u or "ASSET RECONSTRUCTION" in u:
             bank_name = "ARCIL"
@@ -113,18 +67,17 @@ def parse_notice_data(full_text, filename):
         bank_name = "ARCIL" if "arcil" in full_text.lower() else "BANK NOTICE"
     bank_name = bank_name.upper()
 
-    # 2. Borrower Name (Only primary borrower)
+    # 2. Borrower Name (Strictly only the primary borrower)
     borrower_name = ""
     clean_fn = filename.replace("_Cutting", "").replace(".pdf", "")
     tokens = [w for w in clean_fn.split() if not any(c.isdigit() for c in w)]
-    filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION"]
+    filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION", "SALE"]
     clean_tokens = [w for w in tokens if w.upper() not in filter_words]
     if clean_tokens:
-        b_raw = " ".join(clean_tokens)
-        borrower_name = b_raw.replace("MrMrs.", "").replace("Mr.", "").replace("Mrs.", "").strip()
+        borrower_name = " ".join(clean_tokens).replace("MrMrs.", "").replace("Mr.", "").replace("Mrs.", "").strip()
 
     if not borrower_name:
-        for idx, line in enumerate(lines):
+        for line in lines:
             if "borrower" in line.lower():
                 val = line.split(":")[-1]
                 val = val.split("/")[0].split("Co-")[0].strip()
@@ -132,7 +85,7 @@ def parse_notice_data(full_text, filename):
                     borrower_name = clean_val(val)
                     break
 
-    # 3. Currency / Reserve Price & EMD
+    # 3. Reserve Price & EMD Amounts
     amounts = re.findall(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)', full_text, re.I)
     if not amounts:
         amounts = re.findall(r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b', full_text)
@@ -187,43 +140,34 @@ def process_single_pdf(file_bytes, filename):
     base_name = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    cut_doc = fitz.open()
-    full_text = ""
+    full_page_doc = fitz.open()
+    target_page_idx = 0
 
+    # Locate the page with the sale notice
     for page_num in range(len(doc)):
-        page = doc[page_num]
-        txt = page.get_text()
-        full_text += txt + "\n"
+        txt = doc[page_num].get_text().lower()
+        if any(kw in txt for kw in ["auction", "sale notice", "sarfaesi", "arcil", "reserve price"]):
+            target_page_idx = page_num
+            break
 
-        check_kw = ["auction", "sale notice", "sarfaesi", "arcil"]
-        if any(kw in txt.lower() for kw in check_kw):
-            crop_box = get_precise_notice_box(page)
-            temp = fitz.open()
-            temp.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            temp[0].set_cropbox(crop_box)
-            cut_doc.insert_pdf(temp)
-            temp.close()
+    # Extract the full original vector page (no clipping / no text distortion)
+    full_page_doc.insert_pdf(doc, from_page=target_page_idx, to_page=target_page_idx)
+    target_page = doc[target_page_idx]
 
-    if len(cut_doc) == 0 and len(doc) > 0:
-        crop_box = get_precise_notice_box(doc[0])
-        temp = fitz.open()
-        temp.insert_pdf(doc, from_page=0, to_page=0)
-        temp[0].set_cropbox(crop_box)
-        cut_doc.insert_pdf(temp)
-        temp.close()
+    pdf_bytes = full_page_doc.write()
+    full_page_doc.close()
 
-    cut_pdf_bytes = cut_doc.write()
-    cut_doc.close()
+    # Extract Excel Data
+    bank_name, rows = parse_notice_data(target_page, filename)
     doc.close()
 
-    bank_name, rows = parse_notice_data(full_text, filename)
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
         s_name = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30] or "Notice Data"
         pd.DataFrame(rows).to_excel(writer, sheet_name=s_name, index=False)
-    excel_bytes = out.getvalue()
+    excel_bytes = output.getvalue()
 
-    return base_name, cut_pdf_bytes, excel_bytes, rows
+    return base_name, pdf_bytes, excel_bytes, rows
 
 if start_btn:
     if not uploaded_files:
@@ -240,10 +184,10 @@ if start_btn:
             for idx, file in enumerate(uploaded_files):
                 status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
                 file_data = file.getvalue()
-                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name)
+                base, notice_pdf, excel_data, rows = process_single_pdf(file_data, file.name)
 
-                if cut_pdf:
-                    zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
+                if notice_pdf:
+                    zip_file.writestr(f"{base}/{base}_NoticePage.pdf", notice_pdf)
                 if excel_data:
                     zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
                 if rows:
