@@ -32,13 +32,12 @@ def clean_prop(text):
     if not text:
         return ""
     c = clean_val(text)
-    # Only alphanumeric, spaces, commas, and periods
     return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', c).strip()
 
 def clean_amount(val_str):
     if not val_str:
         return ""
-    cleaned = re.sub(r'(?i)(rs\.?|inr|₹)', '', val_str)
+    cleaned = re.sub(r'(?i)(rs\.?|inr|₹)', '', str(val_str))
     return clean_val(cleaned)
 
 def extract_bank_name(lines, full_text):
@@ -104,7 +103,6 @@ def style_excel_worksheet(ws):
     thin_side = Side(border_style="thin", color="000000")
     all_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
-    # Header Row
     ws.row_dimensions[1].height = 28
     for col_idx in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=col_idx)
@@ -113,20 +111,17 @@ def style_excel_worksheet(ws):
         cell.alignment = center_align
         cell.border = all_border
 
-    # Data Rows
     for row_idx in range(2, ws.max_row + 1):
         ws.row_dimensions[row_idx].height = 55
         for col_idx in range(1, ws.max_column + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
             cell.font = Font(name="Calibri", size=10)
             cell.border = all_border
-            # Column 4 is Property Description
             if col_idx == 4:
                 cell.alignment = prop_align
             else:
                 cell.alignment = center_align
 
-    # Auto-adjust column widths
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -147,7 +142,6 @@ def parse_notice_document(doc, filename):
 
     target_page = doc[t_idx]
 
-    # Full unclipped broadsheet page export
     full_rect = target_page.rect
     target_page.set_cropbox(full_rect)
     target_page.set_mediabox(full_rect)
@@ -165,7 +159,6 @@ def parse_notice_document(doc, filename):
     bank_name = extract_bank_name(lines, full_text).upper()
     borrower = extract_borrower(filename, lines)
 
-    # Reserve Price & EMD
     amounts = re.findall(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)', full_text, re.I)
     if not amounts:
         amounts = re.findall(r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b', full_text)
@@ -185,7 +178,6 @@ def parse_notice_document(doc, filename):
     emd_last_time = clean_val(times[0]) if len(times) > 0 else "05:00 PM"
     auction_time = clean_val(times[1]) if len(times) > 1 else "11:00 AM - 12:00 PM"
 
-    # Property Description
     prop_desc = ""
     for idx, line in enumerate(lines):
         line_l = line.lower()
@@ -196,7 +188,6 @@ def parse_notice_document(doc, filename):
         mid = len(lines) // 2
         prop_desc = " ".join(lines[mid:mid+5]) if lines else "Details as per attached notice."
 
-    # 9 Required Columns without Account Number
     row_data = {
         "S.No.": 1,
         "Bank Name": bank_name,
@@ -233,7 +224,8 @@ if start_btn:
         total = len(uploaded_files)
         all_master = []
 
-        with zipfile.ZipFile(zip_buf, "w") as zf:
+        # Proper ZipFile creation with Deflate compression
+        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             for i, f in enumerate(uploaded_files):
                 status.text(f"Processing ({i+1}/{total}): {f.name}")
                 base = os.path.splitext(f.name)[0]
@@ -243,9 +235,9 @@ if start_btn:
                 doc.close()
 
                 if p_pdf:
-                    zf.writestr(f"{base}/{base}_Complete_Page.pdf", p_pdf)
+                    zf.writestr(f"{base}_Complete_Page.pdf", p_pdf)
                 if x_data:
-                    zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
+                    zf.writestr(f"{base}_Data.xlsx", x_data)
                 if m_rows:
                     all_master.extend(m_rows)
 
@@ -258,10 +250,14 @@ if start_btn:
                     m_df.to_csv(index=False).encode('utf-8')
                 )
 
+        zip_buf.seek(0)
+        final_zip = zip_buf.getvalue()
+
         status.success("All Done!")
         st.download_button(
             label="📥 Download All Deliverables (ZIP)",
-            data=zip_buf.getvalue(),
+            data=final_zip,
             file_name="Processed_Auctions.zip",
             mime="application/zip"
-        )
+    )
+        
