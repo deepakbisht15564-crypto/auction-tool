@@ -72,7 +72,7 @@ def process_single_pdf(file_bytes, filename, groq_client):
     cut_pdf_bytes = cut_doc.write()
     cut_doc.close()
 
-    # 2. Fast AI Extraction via Groq Llama-3.3
+    # 2. Fast AI Extraction via Groq
     excel_bytes = None
     all_rows = []
 
@@ -97,57 +97,71 @@ Return ONLY a valid JSON list of objects: [{{"bank_or_arc_name": "...", ...}}]
 Text:
 {full_text[:30000]}
 """
-        try:
-            chat_completion = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You return only pure valid JSON arrays with no markdown or explanation."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-                temperature=0.1
-            )
-            raw_json = chat_completion.choices[0].message.content.strip()
+        models_to_try = ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+        raw_json = None
+        last_err = ""
 
-            if raw_json.startswith("```json"):
-                raw_json = raw_json[7:-3].strip()
-            elif raw_json.startswith("```"):
-                raw_json = raw_json[3:-3].strip()
+        for model_name in models_to_try:
+            try:
+                chat_completion = groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": "You return only pure valid JSON arrays with no markdown or explanation."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    model=model_name,
+                    temperature=0.1
+                )
+                raw_json = chat_completion.choices[0].message.content.strip()
+                if raw_json:
+                    break
+            except Exception as e:
+                last_err = str(e)
+                continue
 
-            data = json.loads(raw_json)
-            if isinstance(data, dict) and "notices" in data:
-                data = data["notices"]
-            elif not isinstance(data, list):
-                data = [data]
+        if raw_json:
+            try:
+                if raw_json.startswith("```json"):
+                    raw_json = raw_json[7:-3].strip()
+                elif raw_json.startswith("```"):
+                    raw_json = raw_json[3:-3].strip()
 
-            if data:
-                bank_groups = {}
-                for item in data:
-                    bank = item.get("bank_or_arc_name", "Others") or "Others"
-                    bank = str(bank).strip().upper()
-                    sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
-                    row = {
-                        "Notice File": filename,
-                        "Bank / ARC": bank,
-                        "S.No.": item.get("s_no", ""),
-                        "Account / Prospect No.": item.get("account_prospect_no", ""),
-                        "Borrower(s) Name": item.get("borrower_name", ""),
-                        "Property Description": clean_text(item.get("property_description", "")),
-                        "Reserve Price": item.get("reserve_price", ""),
-                        "EMD Amount": item.get("emd_amount", ""),
-                        "Inspection Date & Time": item.get("inspection_date_time", ""),
-                        "EMD Last Date & Time": item.get("emd_last_date_time", ""),
-                        "Auction Date & Time": item.get("auction_date_time", "")
-                    }
-                    bank_groups.setdefault(sheet_name, []).append(row)
-                    all_rows.append(row)
+                data = json.loads(raw_json)
+                if isinstance(data, dict) and "notices" in data:
+                    data = data["notices"]
+                elif not isinstance(data, list):
+                    data = [data]
 
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    for sheet, rows in bank_groups.items():
-                        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+                if data:
+                    bank_groups = {}
+                    for item in data:
+                        bank = item.get("bank_or_arc_name", "Others") or "Others"
+                        bank = str(bank).strip().upper()
+                        sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
+                        row = {
+                            "Notice File": filename,
+                            "Bank / ARC": bank,
+                            "S.No.": item.get("s_no", ""),
+                            "Account / Prospect No.": item.get("account_prospect_no", ""),
+                            "Borrower(s) Name": item.get("borrower_name", ""),
+                            "Property Description": clean_text(item.get("property_description", "")),
+                            "Reserve Price": item.get("reserve_price", ""),
+                            "EMD Amount": item.get("emd_amount", ""),
+                            "Inspection Date & Time": item.get("inspection_date_time", ""),
+                            "EMD Last Date & Time": item.get("emd_last_date_time", ""),
+                            "Auction Date & Time": item.get("auction_date_time", "")
+                        }
+                        bank_groups.setdefault(sheet_name, []).append(row)
+                        all_rows.append(row)
+
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        for sheet, rows in bank_groups.items():
+                            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
                     excel_bytes = output.getvalue()
-        except Exception as e:
-            st.error(f"Extraction error on {filename}: {str(e)}")
+            except Exception as e:
+                st.error(f"JSON format error on {filename}: {str(e)}")
+        else:
+            st.error(f"Extraction error on {filename}: {last_err}")
 
     doc.close()
     return base_name, cut_pdf_bytes, excel_bytes, all_rows
