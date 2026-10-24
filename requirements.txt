@@ -1,5 +1,7 @@
-streamlit
-PyMuPDF
-pandas
-openpyxl
-google-generativeai
+@echo off
+setlocal
+cd /d "%~dp0"
+set GEMINI_API_KEY=AIzaSyYourActualKeyHere
+python -m pip install --quiet pymupdf opencv-python-headless pandas openpyxl pillow pydantic google-genai
+python auction_processor.py
+pause
