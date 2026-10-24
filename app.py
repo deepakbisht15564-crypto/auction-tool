@@ -1,21 +1,77 @@
 import streamlit as st
 import os
 import re
-import json
 import zipfile
 import io
 import fitz  # PyMuPDF
 import pandas as pd
-from groq import Groq
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("📄 Bulk E-Auction PDF Processor")
-st.write("Ultra-Fast AI Extraction powered by Groq.")
-
-api_key = st.sidebar.text_input("Enter Groq API Key (starts with gsk_)", type="password")
+st.write("100% Local Engine — No API Keys, No Quota Limits, No Server Errors.")
 
 def clean_text(text: str) -> str:
     return re.sub(r'[\r\n\t]+', ' ', str(text)).strip()
+
+def extract_notice_details(full_text, filename):
+    # 1. Bank / ARC Identification
+    bank_name = "OTHERS"
+    text_lower = full_text.lower()
+    if "arcil" in text_lower or "asset reconstruction" in text_lower:
+        bank_name = "ARCIL"
+    elif "state bank" in text_lower or "sbi" in text_lower:
+        bank_name = "STATE BANK OF INDIA"
+    elif "hdfc" in text_lower:
+        bank_name = "HDFC BANK"
+    elif "icici" in text_lower:
+        bank_name = "ICICI BANK"
+    elif "canara" in text_lower:
+        bank_name = "CANARA BANK"
+    elif "punjab national" in text_lower or "pnb" in text_lower:
+        bank_name = "PNB"
+
+    # 2. Reserve Price
+    rp_match = re.search(r'(?:reserve\s*price|r\.?p\.?)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
+    reserve_price = rp_match.group(1).strip() if rp_match else ""
+
+    # 3. EMD Amount
+    emd_match = re.search(r'(?:emd\s*amount|emd)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
+    emd_amount = emd_match.group(1).strip() if emd_match else ""
+
+    # 4. Account / NPA / Prospect No
+    acc_match = re.search(r'(?:account|ac|prospect|loan|npa)\s*(?:no|number)?[:\s\.\-]*([A-Z0-9\/\-]+)', full_text, re.IGNORECASE)
+    account_no = acc_match.group(1).strip() if acc_match else ""
+
+    # 5. Borrower Name
+    borrower_match = re.search(r'(?:borrower|guarantor|name\s*of\s*borrower)s?[:\s\-]+([A-Za-z0-9\s,\.\/]+?)(?=\n|property|description|reserve|outstanding)', full_text, re.IGNORECASE)
+    borrower_name = clean_text(borrower_match.group(1)) if borrower_match else ""
+
+    # 6. Auction Date & Time
+    auction_match = re.search(r'(?:auction\s*date|date\s*of\s*auction|date\s*and\s*time)[^\d]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}[^\n]*)', full_text, re.IGNORECASE)
+    auction_date = clean_text(auction_match.group(1)) if auction_match else ""
+
+    # 7. EMD Last Date
+    emd_date_match = re.search(r'(?:last\s*date\s*of\s*submission|last\s*date\s*for\s*submission|emd\s*last\s*date)[^\d]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})', full_text, re.IGNORECASE)
+    emd_date = emd_date_match.group(1).strip() if emd_date_match else ""
+
+    # 8. Property Description
+    prop_match = re.search(r'(?:description\s*of\s*property|property\s*details|schedule)[^\n]*\n([\s\S]{80,500})', full_text, re.IGNORECASE)
+    property_desc = clean_text(prop_match.group(1)) if prop_match else clean_text(full_text[:350])
+
+    row = {
+        "Notice File": filename,
+        "Bank / ARC": bank_name,
+        "S.No.": "1",
+        "Account / Prospect No.": account_no,
+        "Borrower(s) Name": borrower_name,
+        "Property Description": property_desc,
+        "Reserve Price": reserve_price,
+        "EMD Amount": emd_amount,
+        "Inspection Date & Time": "",
+        "EMD Last Date & Time": emd_date,
+        "Auction Date & Time": auction_date
+    }
+    return bank_name, [row]
 
 def get_notice_crop_box(page):
     keywords = ["arcil", "asset reconstruction", "e-auction", "sale notice", "sarfaesi", "reserve price", "emd"]
@@ -30,6 +86,7 @@ def get_notice_crop_box(page):
         for r in found_rects[1:]:
             bbox |= r
         
+        # Crop exactly around notice keywords with margin
         return fitz.Rect(
             max(0, bbox.x0 - 20),
             max(0, bbox.y0 - 25),
@@ -37,13 +94,13 @@ def get_notice_crop_box(page):
             min(page.rect.height, bbox.y1 + 100)
         )
     else:
+        # Fallback to notice section (bottom half)
         return fitz.Rect(0, page.rect.height * 0.45, page.rect.width, page.rect.height)
 
-def process_single_pdf(file_bytes, filename, groq_client):
+def process_single_pdf(file_bytes, filename):
     base_name = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     
-    # 1. Exact Cutting
     cut_doc = fitz.open()
     full_text = ""
 
@@ -56,8 +113,7 @@ def process_single_pdf(file_bytes, filename, groq_client):
             crop_box = get_notice_crop_box(page)
             temp_doc = fitz.open()
             temp_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            p = temp_doc[0]
-            p.set_cropbox(crop_box)
+            temp_doc[0].set_cropbox(crop_box)
             cut_doc.insert_pdf(temp_doc)
             temp_doc.close()
 
@@ -71,129 +127,51 @@ def process_single_pdf(file_bytes, filename, groq_client):
 
     cut_pdf_bytes = cut_doc.write()
     cut_doc.close()
-
-    # 2. Fast AI Extraction via Groq (Active Model: llama-3.1-8b-instant)
-    excel_bytes = None
-    all_rows = []
-
-    if full_text.strip():
-        prompt = f"""
-You are a financial data extraction specialist.
-Extract all Bank / ARC E-Auction Sale Notices from the text into a clean JSON array.
-Keys for each notice object:
-- "bank_or_arc_name"
-- "s_no"
-- "account_prospect_no"
-- "borrower_name"
-- "property_description"
-- "reserve_price"
-- "emd_amount"
-- "inspection_date_time"
-- "emd_last_date_time"
-- "auction_date_time"
-
-Return ONLY a valid JSON list of objects: [{{"bank_or_arc_name": "...", ...}}]
-
-Text:
-{full_text[:30000]}
-"""
-        raw_json = None
-        try:
-            chat_completion = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You return only pure valid JSON arrays with no markdown formatting tags."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.1-8b-instant",
-                temperature=0.1
-            )
-            raw_json = chat_completion.choices[0].message.content.strip()
-        except Exception as e:
-            st.error(f"Extraction error on {filename}: {str(e)}")
-
-        if raw_json:
-            try:
-                if raw_json.startswith("```json"):
-                    raw_json = raw_json[7:-3].strip()
-                elif raw_json.startswith("```"):
-                    raw_json = raw_json[3:-3].strip()
-
-                data = json.loads(raw_json)
-                if isinstance(data, dict) and "notices" in data:
-                    data = data["notices"]
-                elif not isinstance(data, list):
-                    data = [data]
-
-                if data:
-                    bank_groups = {}
-                    for item in data:
-                        bank = item.get("bank_or_arc_name", "Others") or "Others"
-                        bank = str(bank).strip().upper()
-                        sheet_name = re.sub(r'[\\/*?:\[\]]', '', bank)[:30] or "Sheet1"
-                        row = {
-                            "Notice File": filename,
-                            "Bank / ARC": bank,
-                            "S.No.": item.get("s_no", ""),
-                            "Account / Prospect No.": item.get("account_prospect_no", ""),
-                            "Borrower(s) Name": item.get("borrower_name", ""),
-                            "Property Description": clean_text(item.get("property_description", "")),
-                            "Reserve Price": item.get("reserve_price", ""),
-                            "EMD Amount": item.get("emd_amount", ""),
-                            "Inspection Date & Time": item.get("inspection_date_time", ""),
-                            "EMD Last Date & Time": item.get("emd_last_date_time", ""),
-                            "Auction Date & Time": item.get("auction_date_time", "")
-                        }
-                        bank_groups.setdefault(sheet_name, []).append(row)
-                        all_rows.append(row)
-
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        for sheet, rows in bank_groups.items():
-                            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
-                    excel_bytes = output.getvalue()
-            except Exception as e:
-                st.error(f"JSON format error on {filename}: {str(e)}")
-
     doc.close()
-    return base_name, cut_pdf_bytes, excel_bytes, all_rows
+
+    # Local Excel Creation
+    bank_name, rows = extract_notice_details(full_text, filename)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        sheet = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30] or "Sheet1"
+        pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
+    excel_bytes = output.getvalue()
+
+    return base_name, cut_pdf_bytes, excel_bytes, rows
 
 uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing"):
-    if not api_key:
-        st.error("Please enter your Groq API Key in the sidebar!")
-    else:
-        groq_client = Groq(api_key=api_key)
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        zip_buffer = io.BytesIO()
-        total = len(uploaded_files)
-        master_rows = []
-        
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            for idx, file in enumerate(uploaded_files):
-                status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
-                file_data = file.getvalue()
-                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, groq_client)
-                
-                if cut_pdf:
-                    zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
-                if excel_data:
-                    zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
-                if rows:
-                    master_rows.extend(rows)
-                
-                progress_bar.progress((idx + 1) / total)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    zip_buffer = io.BytesIO()
+    total = len(uploaded_files)
+    master_rows = []
+    
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        for idx, file in enumerate(uploaded_files):
+            status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
+            file_data = file.getvalue()
+            base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name)
+            
+            if cut_pdf:
+                zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
+            if excel_data:
+                zip_file.writestr(f"{base}/{base}_Data.xlsx", excel_data)
+            if rows:
+                master_rows.extend(rows)
+            
+            progress_bar.progress((idx + 1) / total)
 
-            if master_rows:
-                master_df = pd.DataFrame(master_rows)
-                zip_file.writestr("CRM_All_Accounts_Master.csv", master_df.to_csv(index=False).encode('utf-8'))
+        if master_rows:
+            master_df = pd.DataFrame(master_rows)
+            zip_file.writestr("CRM_All_Accounts_Master.csv", master_df.to_csv(index=False).encode('utf-8'))
 
-        status_text.success("All Done!")
-        st.download_button(
-            label="📥 Download All Deliverables (ZIP)",
-            data=zip_buffer.getvalue(),
-            file_name="Processed_Auctions.zip",
-            mime="application/zip"
-        )
+    status_text.success("All Done!")
+    st.download_button(
+        label="📥 Download All Deliverables (ZIP)",
+        data=zip_buffer.getvalue(),
+        file_name="Processed_Auctions.zip",
+        mime="application/zip"
+    )
