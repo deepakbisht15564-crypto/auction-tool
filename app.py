@@ -1,193 +1,219 @@
-import io, re, os, tempfile
-from datetime import datetime
 import streamlit as st
+import os
+import re
+import json
+import zipfile
+import io
+import time
+import fitz
 import pandas as pd
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
-import pytesseract
-from pdf2image import convert_from_bytes
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
+from PIL import Image
+from google import genai
+from google.genai import types
 
-st.set_page_config(page_title="Bank E-Auction Notice Extractor", page_icon="📄", layout="wide")
-st.title("📄 Bank E-Auction Notice Extractor")
-st.caption("Upload newspaper cuttings, photos or PDFs → OCR → review → Excel export. Free, local-first starter version.")
+st.set_page_config(
+    page_title="Bulk E-Auction Notice Processor",
+    layout="wide"
+)
+st.title("📄 Bulk E-Auction PDF Processor")
+st.write("Clean Box Cutting + 9-Column Multi-Sheet Excel.")
 
-with st.expander("Important: accuracy and privacy", expanded=True):
-    st.write(
-        "OCR can misread small, blurred or low-resolution print. This app keeps the extracted text and original file name "
-        "for checking; always compare names, amounts and dates against the notice before relying on them. "
-        "The app runs on your computer when started locally. Files are processed by this app; do not expose it to the public internet."
-    )
+api_key = st.sidebar.text_input(
+    "Enter Gemini API Key",
+    type="password"
+)
 
-with st.sidebar:
-    st.header("OCR settings")
-    lang = st.selectbox("Notice language", ["English", "English + Hindi"], index=0)
-    ocr_lang = "eng+hin" if lang == "English + Hindi" else "eng"
-    psm = st.selectbox("OCR layout mode", ["Automatic (recommended)", "Single column", "Single block"], index=0)
-    psm_num = {"Automatic (recommended)": 3, "Single column": 4, "Single block": 6}[psm]
-    scale = st.selectbox("Image enlargement", ["2× (recommended)", "3×", "No enlargement"], index=0)
-    scale_factor = {"2× (recommended)": 2, "3×": 3, "No enlargement": 1}[scale]
+uploaded_files = st.file_uploader(
+    "Upload Auction PDFs (Bulk)",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+start_btn = st.button("Start Processing")
 
-st.markdown("### 1. Upload notices")
-uploads = st.file_uploader("Choose image(s) or PDF(s)", type=["png","jpg","jpeg","tif","tiff","bmp","webp","pdf"], accept_multiple_files=True)
+def clean_val(text):
+    if not text:
+        return ""
+    c = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', str(text))
+    return " ".join(c.split()).strip()
 
-def prep_image(im, factor=2):
-    im = ImageOps.exif_transpose(im).convert("RGB")
-    if factor > 1:
-        im = im.resize((im.width*factor, im.height*factor), Image.Resampling.LANCZOS)
-    gray = ImageOps.grayscale(im)
-    gray = ImageEnhance.Contrast(gray).enhance(1.8)
-    gray = gray.filter(ImageFilter.SHARPEN)
-    return gray
+def clean_prop(text):
+    if not text:
+        return ""
+    c = clean_val(text)
+    return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', c).strip()
 
-def get_pages(upload, factor):
-    data = upload.getvalue()
-    name = upload.name.lower()
-    if name.endswith(".pdf"):
-        try:
-            pages = convert_from_bytes(data, dpi=300, fmt="png")
-        except Exception as e:
-            raise RuntimeError("PDF read nahi hua. Windows par Poppler install karna zaroori ho sakta hai. Details: " + str(e))
-        return [prep_image(p, factor) for p in pages]
-    return [prep_image(Image.open(io.BytesIO(data)), factor)]
-
-def ocr_pages(pages, lang, psm_num):
-    chunks = []
-    for i, page in enumerate(pages, 1):
-        config = f"--oem 3 --psm {psm_num}"
-        txt = pytesseract.image_to_string(page, lang=lang, config=config)
-        chunks.append(f"--- PAGE {i} ---\n{txt}")
-    return "\n\n".join(chunks)
-
-def find_first(patterns, text):
-    for pat in patterns:
-        m = re.search(pat, text, re.I | re.M)
-        if m:
-            return re.sub(r"\s+", " ", m.group(1)).strip(" :.-\t")
-    return ""
-
-def money_candidates(text):
-    pats = [
-        r"(?:reserve\s*price|reserved\s*price|upset\s*price|reserve\s*price\s*\(rs\.?\))\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
-        r"(?:EMD|earnest\s*money\s*deposit)\s*(?:amount)?\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
+def get_notice_box(page):
+    anchors = [
+        "sale notice", "e-auction", "sarfaesi",
+        "arcil", "reserve price", "authorised officer"
     ]
-    reserve = find_first([pats[0]], text)
-    emd = find_first([pats[1]], text)
-    return reserve, emd
-
-def extract_fields(text, filename):
-    # Conservative label-based extraction; review every result before use.
-    borrower = find_first([
-        r"(?:name\s+of\s+the\s+borrower|borrower(?:\s+name)?|name\s+of\s+borrower)\s*[:\-]\s*([^\n\r]+)",
-        r"(?:borrower)\s*[:\-]\s*([^\n\r]+)"
-    ], text)
-    # Do not use co-borrower/coborrower label as borrower.
-    if borrower and re.search(r"co[\s\-]?borrower", borrower, re.I):
-        borrower = ""
-    prop = find_first([
-        r"(?:description\s+of\s+(?:the\s+)?property|property\s+description|details\s+of\s+(?:the\s+)?property|description\s+of\s+secured\s+asset)\s*[:\-]?\s*([\s\S]{1,900}?)(?=\n\s*(?:reserve\s*price|emd|earnest|date\s+of\s+auction|auction\s+date|inspection|terms\s+and\s+conditions)\b|$)",
-    ], text)
-    bank = find_first([
-        r"((?:[A-Z][A-Za-z&'.()\- ]{2,70}\s+Bank)(?:\s+Ltd\.?|\s+Limited)?)",
-    ], text)
-    branch = find_first([r"(?:branch|branch office)\s*[:\-]\s*([^\n\r]+)"], text)
-    reserve, emd = money_candidates(text)
-    emd_date = find_first([
-        r"(?:last\s+date\s+for\s+(?:submission|deposit)\s+of\s+EMD|EMD\s+(?:submission|deposit)\s+date|date\s+for\s+deposit\s+of\s+EMD)\s*[:\-]?\s*([^\n\r]+)"
-    ], text)
-    emd_time = find_first([
-        r"(?:EMD\s+(?:submission|deposit)\s+time|time\s+for\s+deposit\s+of\s+EMD|last\s+time\s+for\s+(?:submission|deposit)\s+of\s+EMD)\s*[:\-]?\s*([^\n\r]+)"
-    ], text)
-    auction_date = find_first([
-        r"(?:date\s+(?:of\s+)?(?:e[\-\s]?auction|auction)|auction\s+date|e[\-\s]?auction\s+date)\s*[:\-]?\s*([^\n\r]+)"
-    ], text)
-    auction_time = find_first([
-        r"(?:time\s+(?:of\s+)?(?:e[\-\s]?auction|auction)|auction\s+time|e[\-\s]?auction\s+time|auction\s+will\s+commence)\s*[:\-]?\s*([^\n\r]+)"
-    ], text)
-    inspection = find_first([
-        r"(?:date\s+and\s+time\s+of\s+inspection|inspection\s+(?:date|schedule|time))\s*[:\-]?\s*([^\n\r]+)"
-    ], text)
-    notice_no = find_first([
-        r"(?:notice\s*(?:no\.?|number)|reference\s*(?:no\.?|number)|loan\s*(?:account)?\s*no\.?)\s*[:\-]?\s*([A-Z0-9/\-]+)"
-    ], text)
-    return {
-        "Source File": filename,
-        "Bank Name": bank,
-        "Branch": branch,
-        "Borrower Name (NOT Co-borrower)": borrower,
-        "Property Description (OCR text)": prop,
-        "Reserve Price": reserve,
-        "EMD Amount": emd,
-        "EMD Date (as printed)": emd_date,
-        "EMD Time (as printed)": emd_time,
-        "Auction Date (as printed)": auction_date,
-        "Auction Time (as printed)": auction_time,
-        "Inspection Details (if stated)": inspection,
-        "Notice / Reference No.": notice_no,
-        "Additional Notice Details / Review Notes": "",
-        "Verification Status": "Review required",
-    }
-
-if uploads:
-    if st.button("🔎 Read notices", type="primary"):
-        records, full_texts, errors = [], {}, []
-        prog = st.progress(0)
-        for idx, up in enumerate(uploads):
-            try:
-                pages = get_pages(up, scale_factor)
-                txt = ocr_pages(pages, ocr_lang, psm_num)
-                full_texts[up.name] = txt
-                rec = extract_fields(txt, up.name)
-                rec["Additional Notice Details / Review Notes"] = "Check full OCR text; add any notice details not captured in fields."
-                records.append(rec)
-            except Exception as e:
-                errors.append(f"{up.name}: {e}")
-            prog.progress((idx+1)/len(uploads))
-        st.session_state["records"] = records
-        st.session_state["full_texts"] = full_texts
-        st.session_state["errors"] = errors
-
-if "errors" in st.session_state and st.session_state["errors"]:
-    st.error("Some files could not be processed:\n\n" + "\n".join(st.session_state["errors"]))
-
-if "records" in st.session_state and st.session_state["records"]:
-    st.markdown("### 2. Review and correct extracted data")
-    st.warning("Borrower name, property description, money values, dates and times must be checked against the original notice. OCR extraction is a first pass, not a guarantee.")
-    df = pd.DataFrame(st.session_state["records"])
-    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key="edit_table")
-    st.markdown("### 3. Check original OCR text")
-    for fname, txt in st.session_state["full_texts"].items():
-        with st.expander(f"Extracted OCR text — {fname}"):
-            st.text_area("OCR text", txt, height=280, key="ocr_"+re.sub(r'[^A-Za-z0-9]', '_', fname))
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        edited.to_excel(writer, index=False, sheet_name="Auction Notices")
-        raw = pd.DataFrame([{"Source File": k, "Full OCR Text": v} for k,v in st.session_state["full_texts"].items()])
-        raw.to_excel(writer, index=False, sheet_name="Full OCR Text")
-        wb = writer.book
-        for ws in wb.worksheets:
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-            for cell in ws[1]:
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill("solid", fgColor="1F4E78")
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-            for col in ws.columns:
-                max_len = min(max((len(str(c.value or "")) for c in col[:80]), default=10) + 2, 55)
-                ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len, 14)
-            for row in ws.iter_rows(min_row=2):
-                for cell in row:
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-    st.download_button(
-        "⬇️ Download Excel (.xlsx)",
-        data=out.getvalue(),
-        file_name=f"bank_eauction_notices_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
+    hits = []
+    for a in anchors:
+        r = page.search_for(a)
+        if r:
+            hits.extend(r)
+    if hits:
+        min_x = min(h.x0 for h in hits)
+        min_y = min(h.y0 for h in hits)
+        max_x = max(h.x1 for h in hits)
+        max_y = max(h.y1 for h in hits)
+        return fitz.Rect(
+            max(0, min_x - 15),
+            max(0, min_y - 25),
+            min(page.rect.width, max_x + 15),
+            min(page.rect.height, max_y + 35)
+        )
+    return fitz.Rect(
+        page.rect.width * 0.30,
+        page.rect.height * 0.45,
+        page.rect.width,
+        page.rect.height
     )
-else:
-    st.info("Upload one or more notices above, then click **Read notices**.")
 
-st.markdown("---")
-st.markdown("**Borrower-only rule:** the app tries to read a value attached to a Borrower label and rejects a value that appears to be labelled Co-borrower. Because bank formats vary, verify borrower names manually.")
+def extract_with_ai(client, page, box):
+    pix = page.get_pixmap(clip=box, dpi=200)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    
+    prompt = """
+    Extract all Bank / ARC E-Auction Sale Notices from this image.
+    Return ONLY a JSON list of objects with these exact keys:
+    - "bank_or_arc_name": Exact Bank or ARC name (e.g. Arcil, SBI, etc.)
+    - "account_prospect_no": Account / Loan / NPA number
+    - "borrower_name": ONLY Primary Borrower Name. Exclude Co-Borrowers/Guarantors.
+    - "property_description": Property details & schedule
+    - "reserve_price": Reserve Price with currency
+    - "emd_amount": EMD Amount with currency
+    - "inspection_date_time": Inspection Date & Time
+    - "emd_last_date_time": EMD Last Date & Time
+    - "auction_date_time": Auction Date & Time
+    """
+    
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=[prompt, img],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0
+                )
+            )
+            raw = resp.text.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:-3].strip()
+            elif raw.startswith("```"):
+                raw = raw[3:-3].strip()
+            data = json.loads(raw)
+            if isinstance(data, dict) and "notices" in data:
+                return data["notices"]
+            elif isinstance(data, list):
+                return data
+            return [data]
+        except Exception:
+            time.sleep(2)
+    return []
+
+def process_pdf(file_bytes, filename, client):
+    base = os.path.splitext(filename)[0]
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    
+    t_idx = 0
+    for idx, page in enumerate(doc):
+        txt = page.get_text().lower()
+        if any(w in txt for w in ["sale", "auction", "sarfaesi", "arcil"]):
+            t_idx = idx
+            break
+            
+    page = doc[t_idx]
+    box = get_notice_box(page)
+    
+    # 1. High-resolution Vector Cutting PDF
+    cut_doc = fitz.open()
+    cut_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
+    cut_doc[0].set_cropbox(box)
+    pdf_bytes = cut_doc.write()
+    cut_doc.close()
+    
+    # 2. Vision Extraction
+    records = extract_with_ai(client, page, box)
+    doc.close()
+    
+    # 3. Dedicated Excel Generation (Bank Tabs + 9 Columns)
+    bank_groups = {}
+    master_recs = []
+    
+    for idx, r in enumerate(records, start=1):
+        bank = clean_val(r.get("bank_or_arc_name", "OTHERS")).upper()
+        sheet = re.sub(r'[\\/*?:\[\]]', '', bank)[:30].strip() or "Notice Data"
+        
+        row_dict = {
+            "S.No.": idx,
+            "Account / Prospect No.": clean_val(r.get("account_prospect_no", "")),
+            "Borrower(s) Name": clean_val(r.get("borrower_name", "")),
+            "Property Description": clean_prop(r.get("property_description", "")),
+            "Reserve Price": clean_val(r.get("reserve_price", "")),
+            "EMD Amount": clean_val(r.get("emd_amount", "")),
+            "Inspection Date & Time": clean_val(r.get("inspection_date_time", "")),
+            "EMD Last Date & Time": clean_val(r.get("emd_last_date_time", "")),
+            "Auction Date & Time": clean_val(r.get("auction_date_time", ""))
+        }
+        bank_groups.setdefault(sheet, []).append(row_dict)
+        
+        m_row = dict(row_dict)
+        m_row["Source_File"] = filename
+        m_row["Bank_or_ARC"] = bank
+        master_recs.append(m_row)
+        
+    excel_bytes = None
+    if bank_groups:
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='openpyxl') as writer:
+            for s_name, rows in bank_groups.items():
+                pd.DataFrame(rows).to_excel(writer, sheet_name=s_name, index=False)
+        excel_bytes = out.getvalue()
+        
+    return base, pdf_bytes, excel_bytes, master_recs
+
+if start_btn:
+    if not api_key:
+        st.error("Please enter Gemini API Key in the sidebar!")
+    elif not uploaded_files:
+        st.warning("Please upload auction PDF files!")
+    else:
+        client = genai.Client(api_key=api_key)
+        prog = st.progress(0)
+        status = st.empty()
+        
+        zip_buf = io.BytesIO()
+        total = len(uploaded_files)
+        all_master = []
+        
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            for i, f in enumerate(uploaded_files):
+                status.text(f"Processing ({i+1}/{total}): {f.name}")
+                base, c_pdf, x_data, m_rows = process_pdf(f.getvalue(), f.name, client)
+                
+                if c_pdf:
+                    zf.writestr(f"{base}/{base}_Cutting.pdf", c_pdf)
+                if x_data:
+                    zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
+                if m_rows:
+                    all_master.extend(m_rows)
+                    
+                prog.progress((i + 1) / total)
+                
+            if all_master:
+                m_df = pd.DataFrame(all_master)
+                zf.writestr(
+                    "CRM_All_Accounts_Master.csv",
+                    m_df.to_csv(index=False).encode('utf-8')
+                )
+                
+        status.success("All Done!")
+        st.download_button(
+            label="📥 Download All Deliverables (ZIP)",
+            data=zip_buf.getvalue(),
+            file_name="Processed_Auctions.zip",
+            mime="application/zip"
+        )
+        
