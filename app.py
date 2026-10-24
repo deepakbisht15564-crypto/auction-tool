@@ -10,11 +10,14 @@ st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("📄 Bulk E-Auction PDF Processor")
 st.write("100% Local Engine — No API Keys, No Quota Limits, No Server Errors.")
 
-def clean_text(text: str) -> str:
-    return re.sub(r'[\r\n\t]+', ' ', str(text)).strip()
+def clean_for_excel(text: str) -> str:
+    if not text:
+        return ""
+    # Remove control characters that break openpyxl
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', str(text))
+    return re.sub(r'[\r\n\t]+', ' ', cleaned).strip()
 
 def extract_notice_details(full_text, filename):
-    # 1. Bank / ARC Identification
     bank_name = "OTHERS"
     text_lower = full_text.lower()
     if "arcil" in text_lower or "asset reconstruction" in text_lower:
@@ -30,33 +33,33 @@ def extract_notice_details(full_text, filename):
     elif "punjab national" in text_lower or "pnb" in text_lower:
         bank_name = "PNB"
 
-    # 2. Reserve Price
+    # Reserve Price
     rp_match = re.search(r'(?:reserve\s*price|r\.?p\.?)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
-    reserve_price = rp_match.group(1).strip() if rp_match else ""
+    reserve_price = clean_for_excel(rp_match.group(1)) if rp_match else ""
 
-    # 3. EMD Amount
+    # EMD Amount
     emd_match = re.search(r'(?:emd\s*amount|emd)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
-    emd_amount = emd_match.group(1).strip() if emd_match else ""
+    emd_amount = clean_for_excel(emd_match.group(1)) if emd_match else ""
 
-    # 4. Account / NPA / Prospect No
+    # Account / NPA / Prospect No
     acc_match = re.search(r'(?:account|ac|prospect|loan|npa)\s*(?:no|number)?[:\s\.\-]*([A-Z0-9\/\-]+)', full_text, re.IGNORECASE)
-    account_no = acc_match.group(1).strip() if acc_match else ""
+    account_no = clean_for_excel(acc_match.group(1)) if acc_match else ""
 
-    # 5. Borrower Name
+    # Borrower Name
     borrower_match = re.search(r'(?:borrower|guarantor|name\s*of\s*borrower)s?[:\s\-]+([A-Za-z0-9\s,\.\/]+?)(?=\n|property|description|reserve|outstanding)', full_text, re.IGNORECASE)
-    borrower_name = clean_text(borrower_match.group(1)) if borrower_match else ""
+    borrower_name = clean_for_excel(borrower_match.group(1)) if borrower_match else ""
 
-    # 6. Auction Date & Time
+    # Auction Date & Time
     auction_match = re.search(r'(?:auction\s*date|date\s*of\s*auction|date\s*and\s*time)[^\d]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}[^\n]*)', full_text, re.IGNORECASE)
-    auction_date = clean_text(auction_match.group(1)) if auction_match else ""
+    auction_date = clean_for_excel(auction_match.group(1)) if auction_match else ""
 
-    # 7. EMD Last Date
+    # EMD Last Date
     emd_date_match = re.search(r'(?:last\s*date\s*of\s*submission|last\s*date\s*for\s*submission|emd\s*last\s*date)[^\d]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})', full_text, re.IGNORECASE)
-    emd_date = emd_date_match.group(1).strip() if emd_date_match else ""
+    emd_date = clean_for_excel(emd_date_match.group(1)) if emd_date_match else ""
 
-    # 8. Property Description
+    # Property Description
     prop_match = re.search(r'(?:description\s*of\s*property|property\s*details|schedule)[^\n]*\n([\s\S]{80,500})', full_text, re.IGNORECASE)
-    property_desc = clean_text(prop_match.group(1)) if prop_match else clean_text(full_text[:350])
+    property_desc = clean_for_excel(prop_match.group(1)) if prop_match else clean_for_excel(full_text[:350])
 
     row = {
         "Notice File": filename,
@@ -86,7 +89,6 @@ def get_notice_crop_box(page):
         for r in found_rects[1:]:
             bbox |= r
         
-        # Crop exactly around notice keywords with margin
         return fitz.Rect(
             max(0, bbox.x0 - 20),
             max(0, bbox.y0 - 25),
@@ -94,7 +96,6 @@ def get_notice_crop_box(page):
             min(page.rect.height, bbox.y1 + 100)
         )
     else:
-        # Fallback to notice section (bottom half)
         return fitz.Rect(0, page.rect.height * 0.45, page.rect.width, page.rect.height)
 
 def process_single_pdf(file_bytes, filename):
@@ -129,7 +130,7 @@ def process_single_pdf(file_bytes, filename):
     cut_doc.close()
     doc.close()
 
-    # Local Excel Creation
+    # Excel Generation (Cleaned of invalid XML characters)
     bank_name, rows = extract_notice_details(full_text, filename)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
