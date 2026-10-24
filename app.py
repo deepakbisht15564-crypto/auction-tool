@@ -8,7 +8,7 @@ import pandas as pd
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("Bulk E-Auction PDF Processor")
-st.write("Box Cuttings + Field-Wise Excel Extraction.")
+st.write("Clean Box Cuttings + Field-Wise Excel Extraction.")
 
 uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 start_btn = st.button("Start Processing")
@@ -20,74 +20,64 @@ def clean_val(text):
     return " ".join(val.split()).strip()
 
 def get_precise_notice_box(page):
-    terms = ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price", "earnest money"]
-    rects = []
-    for t in terms:
-        m = page.search_for(t)
-        if m:
-            rects.extend(m)
+    # Notice identify karne wale primary anchors
+    top_anchors = ["arcil", "asset reconstruction", "sale notice", "e-auction notice", "sarfaesi"]
+    bottom_anchors = ["authorised officer", "terms and conditions", "arcil.co.in", "possession", "reserve price"]
 
-    if rects:
-        rx = rects[0].x0
-        ry = rects[0].y0
+    top_rects = []
+    for t in top_anchors:
+        found = page.search_for(t)
+        if found:
+            top_rects.extend(found)
 
-        box_list = []
-        for d in page.get_drawings():
-            r = d["rect"]
-            if r.width > 140 and r.height > 90:
-                if (r.x0 <= rx <= r.x1) and (r.y0 - 25 <= ry <= r.y1):
-                    box_list.append(r)
+    bottom_rects = []
+    for b in bottom_anchors:
+        found = page.search_for(b)
+        if found:
+            bottom_rects.extend(found)
 
-        if box_list:
-            best = max(box_list, key=lambda b: b.width * b.height)
-            return fitz.Rect(
-                max(0, best.x0 - 2),
-                max(0, best.y0 - 2),
-                min(page.rect.width, best.x1 + 2),
-                min(page.rect.height, best.y1 + 2)
-            )
+    if top_rects:
+        # Notice box ka starting top coordinate
+        y_start = min(r.y0 for r in top_rects) - 25
+        x_start = min(r.x0 for r in top_rects) - 15
 
-        blks = page.get_text("blocks")
-        nb = []
-        for b in blks:
-            bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
-            if (abs(bx0 - rx) < 90 or (bx0 <= rx <= bx1)) and by1 >= (ry - 35):
-                nb.append(fitz.Rect(bx0, by0, bx1, by1))
+        if bottom_rects:
+            # Notice box ke bottom/right coordinates
+            valid_bottoms = [r for r in bottom_rects if r.y1 > y_start]
+            if valid_bottoms:
+                y_end = max(r.y1 for r in valid_bottoms) + 30
+                x_end = max(r.x1 for r in valid_bottoms) + 20
+            else:
+                y_end = page.rect.height
+                x_end = page.rect.width
+        else:
+            y_end = page.rect.height
+            x_end = page.rect.width
 
-        if nb:
-            return fitz.Rect(
-                max(0, min(r.x0 for r in nb) - 10),
-                max(0, min(r.y0 for r in nb) - 15),
-                min(page.rect.width, max(r.x1 for r in nb) + 10),
-                min(page.rect.height, max(r.y1 for r in nb) + 20)
-            )
+        # Strictly notice boundary (prevents left/top ad clippings)
+        return fitz.Rect(
+            max(0, x_start),
+            max(0, y_start),
+            min(page.rect.width, max(x_end, x_start + 250)),
+            min(page.rect.height, y_end)
+        )
 
-    return fitz.Rect(
-        page.rect.width * 0.35,
-        page.rect.height * 0.50,
-        page.rect.width,
-        page.rect.height
-    )
+    # Fallback agar text coordinates match na ho
+    return fitz.Rect(page.rect.width * 0.35, page.rect.height * 0.45, page.rect.width, page.rect.height)
 
 def parse_notice_data(full_text, filename):
     lines = [clean_val(l) for l in full_text.split("\n")]
     lines = [l for l in lines if l]
 
-    # 1. Bank / ARC
+    # 1. Exact Bank / ARC Name Detection
     bank_name = ""
-    for line in lines[:30]:
+    for line in lines[:25]:
         u = line.upper()
         if "ARCIL" in u or "ASSET RECONSTRUCTION" in u:
             bank_name = "ARCIL"
             break
         elif "STATE BANK" in u or "SBI" in u:
             bank_name = "STATE BANK OF INDIA"
-            break
-        elif "HDFC" in u:
-            bank_name = "HDFC BANK"
-            break
-        elif "ICICI" in u:
-            bank_name = "ICICI BANK"
             break
         elif "CANARA" in u:
             bank_name = "CANARA BANK"
@@ -101,6 +91,12 @@ def parse_notice_data(full_text, filename):
         elif "INDIAN BANK" in u:
             bank_name = "INDIAN BANK"
             break
+        elif "HDFC" in u:
+            bank_name = "HDFC BANK"
+            break
+        elif "ICICI" in u:
+            bank_name = "ICICI BANK"
+            break
         elif "AXIS" in u:
             bank_name = "AXIS BANK"
             break
@@ -108,19 +104,20 @@ def parse_notice_data(full_text, filename):
             bank_name = "KOTAK MAHINDRA BANK"
             break
         elif "BANK" in u:
-            bank_name = u.split("BRANCH")[0].split("NOTICE")[0].strip()
-            if len(bank_name) > 3:
+            candidate = u.split("BRANCH")[0].split("NOTICE")[0].strip()
+            if len(candidate) > 4:
+                bank_name = candidate
                 break
 
     if not bank_name:
         bank_name = "ARCIL" if "arcil" in full_text.lower() else "BANK NOTICE"
     bank_name = bank_name.upper()
 
-    # 2. Borrower Name
+    # 2. Borrower Name (Only primary borrower)
     borrower_name = ""
-    cfn = filename.replace("_Cutting", "").replace(".pdf", "")
-    tokens = [w for w in cfn.split() if not any(c.isdigit() for c in w)]
-    filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK"]
+    clean_fn = filename.replace("_Cutting", "").replace(".pdf", "")
+    tokens = [w for w in clean_fn.split() if not any(c.isdigit() for c in w)]
+    filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION"]
     clean_tokens = [w for w in tokens if w.upper() not in filter_words]
     if clean_tokens:
         b_raw = " ".join(clean_tokens)
@@ -129,46 +126,46 @@ def parse_notice_data(full_text, filename):
     if not borrower_name:
         for idx, line in enumerate(lines):
             if "borrower" in line.lower():
-                borrower_name = clean_val(line.split(":")[-1])
-                break
+                val = line.split(":")[-1]
+                val = val.split("/")[0].split("Co-")[0].strip()
+                if len(val) > 2:
+                    borrower_name = clean_val(val)
+                    break
 
-    # 3. Reserve Price
+    # 3. Currency / Reserve Price & EMD
+    amounts = re.findall(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)', full_text, re.I)
+    if not amounts:
+        amounts = re.findall(r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b', full_text)
+
     reserve_price = ""
-    for line in lines:
-        if "reserve" in line.lower() and ("rs" in line.lower() or "₹" in line):
-            reserve_price = clean_val(line.split(":")[-1])
-            break
-    if not reserve_price:
-        amounts = re.findall(r'(?:Rs\.?|₹)\s*[\d,]+(?:\.\d+)?', full_text)
-        if amounts:
-            reserve_price = clean_val(amounts[0])
-
-    # 4. EMD Amount
     emd_amount = ""
-    for line in lines:
-        if "emd" in line.lower() and ("rs" in line.lower() or "₹" in line):
-            emd_amount = clean_val(line.split(":")[-1])
-            break
+    if len(amounts) >= 2:
+        reserve_price = f"Rs. {clean_val(amounts[0])}"
+        emd_amount = f"Rs. {clean_val(amounts[1])}"
+    elif len(amounts) == 1:
+        reserve_price = f"Rs. {clean_val(amounts[0])}"
 
-    # 5. Dates & Times
-    all_d = re.findall(r'\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}', full_text)
-    all_t = re.findall(r'\d{1,2}[:\.]\d{2}\s*(?:AM|PM|hrs|hours)?', full_text, re.I)
+    # 4. Dates & Times
+    dates = re.findall(r'\b\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}\b', full_text)
+    times = re.findall(r'\b\d{1,2}[:\.]\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.|hrs|hours)?\b', full_text, re.I)
 
-    emd_sub_d = all_d[0] if len(all_d) > 0 else ""
-    auc_d = all_d[1] if len(all_d) > 1 else emd_sub_d
+    emd_submit_date = dates[0] if len(dates) > 0 else ""
+    auction_date = dates[1] if len(dates) > 1 else emd_submit_date
+    auction_end_date = auction_date
 
-    emd_sub_t = clean_val(all_t[0]) if len(all_t) > 0 else "05:00 PM"
-    auc_st_t = clean_val(all_t[1]) if len(all_t) > 1 else "11:00 AM"
-    auc_end_t = clean_val(all_t[2]) if len(all_t) > 2 else "12:00 PM"
+    emd_submit_time = clean_val(times[0]) if len(times) > 0 else "05:00 PM"
+    auction_start_time = clean_val(times[1]) if len(times) > 1 else "11:00 AM"
+    auction_end_time = clean_val(times[2]) if len(times) > 2 else "12:00 PM"
 
-    # 6. Property Description
+    # 5. Property Description
     prop_desc = ""
     for idx, line in enumerate(lines):
-        if "property" in line.lower() or "schedule" in line.lower():
-            prop_desc = " ".join(lines[idx:idx+4])
+        if any(kw in line.lower() for kw in ["property", "schedule", "immovable", "piece and parcel"]):
+            prop_desc = " ".join(lines[idx:idx+5])
             break
     if not prop_desc:
-        prop_desc = " ".join(lines[:6])
+        mid = len(lines) // 2
+        prop_desc = " ".join(lines[mid:mid+4])
 
     row = {
         "Notice File": filename,
@@ -177,12 +174,12 @@ def parse_notice_data(full_text, filename):
         "Property Description": clean_val(prop_desc),
         "Reserve Price": reserve_price,
         "EMD Amount": emd_amount,
-        "EMD Submit Date": emd_sub_d,
-        "EMD Submit Time": emd_sub_t,
-        "Auction Date": auc_d,
-        "Auction Start Time": auc_st_t,
-        "Auction End Date": auc_d,
-        "Auction End Time": auc_end_t
+        "EMD Submit Date": emd_submit_date,
+        "EMD Submit Time": emd_submit_time,
+        "Auction Date": auction_date,
+        "Auction Start Time": auction_start_time,
+        "Auction End Date": auction_end_date,
+        "Auction End Time": auction_end_time
     }
     return bank_name, [row]
 
