@@ -8,7 +8,7 @@ import pandas as pd
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("📄 Bulk E-Auction PDF Processor")
-st.write("Clean Box Cuttings + Field-Wise Excel Extraction.")
+st.write("Dynamic Bank Detection + Exact Notice Box Cuttings.")
 
 def clean_val(text: str) -> str:
     if not text:
@@ -17,60 +17,83 @@ def clean_val(text: str) -> str:
     return re.sub(r'[\r\n\t]+', ' ', cleaned).strip()
 
 def get_notice_crop_box(page):
-    keywords = ["arcil", "asset reconstruction", "e-auction", "sale notice", "sarfaesi", "reserve price", "emd"]
-    found_rects = []
+    # Anchor words that mark the START of an auction notice
+    header_keywords = [
+        "sale notice", "e-auction notice", "possession notice", 
+        "demand notice", "appendix iv", "sarfaesi", "asset reconstruction", 
+        "auction sale", "public notice for sale"
+    ]
     
-    for kw in keywords:
-        rects = page.search_for(kw)
-        if rects:
-            found_rects.extend(rects)
+    start_rects = []
+    for kw in header_keywords:
+        r = page.search_for(kw)
+        if r:
+            start_rects.extend(r)
+            
+    # Bottom keywords that define the content bounds
+    content_keywords = ["reserve price", "emd", "date of auction", "terms and conditions", "authorised officer", "arcil"]
+    content_rects = []
+    for kw in content_keywords:
+        r = page.search_for(kw)
+        if r:
+            content_rects.extend(r)
 
-    if found_rects:
-        bbox = found_rects[0]
-        for r in found_rects[1:]:
-            bbox |= r
+    if start_rects:
+        # Lowest y0 among the found headers (start point of notice box)
+        y_top = min([r.y0 for r in start_rects]) - 35
+        x_left = min([r.x0 for r in start_rects]) - 25
         
+        if content_rects:
+            y_bottom = max([r.y1 for r in content_rects]) + 40
+            x_right = max([r.x1 for r in content_rects]) + 25
+        else:
+            y_bottom = page.rect.height
+            x_right = page.rect.width
+
+        # Strictly contain inside the page
         return fitz.Rect(
-            max(0, bbox.x0 - 15),
-            max(0, bbox.y0 - 20),
-            min(page.rect.width, bbox.x1 + 15),
-            min(page.rect.height, bbox.y1 + 40)
+            max(0, x_left),
+            max(0, y_top),
+            min(page.rect.width, x_right),
+            min(page.rect.height, y_bottom)
         )
     else:
-        return fitz.Rect(page.rect.width * 0.38, page.rect.height * 0.52, page.rect.width, page.rect.height)
+        # Fallback to bottom area where commercial notices are published
+        return fitz.Rect(page.rect.width * 0.30, page.rect.height * 0.50, page.rect.width, page.rect.height)
 
 def parse_auction_fields(full_text, filename):
-    text_lower = full_text.lower()
+    lines = [clean_val(l) for l in full_text.split('\n') if clean_val(l)]
     
-    # Bank name
-    bank_name = "OTHERS"
-    if "arcil" in text_lower or "asset reconstruction" in text_lower:
-        bank_name = "ARCIL"
-    elif "state bank" in text_lower or "sbi" in text_lower:
-        bank_name = "STATE BANK OF INDIA"
-    elif "hdfc" in text_lower:
-        bank_name = "HDFC BANK"
-    elif "icici" in text_lower:
-        bank_name = "ICICI BANK"
-    elif "canara" in text_lower:
-        bank_name = "CANARA BANK"
-    elif "punjab national" in text_lower or "pnb" in text_lower:
-        bank_name = "PNB"
+    # 1. Dynamic Bank / ARC Name Extraction (No hardcoded bank list)
+    bank_name = ""
+    for line in lines[:25]:
+        if re.search(r'(?:bank|arcil|asset\s*reconstruction|finance|housing|co-operative|gramin)', line, re.IGNORECASE):
+            # Clean up unwanted words if any
+            bank_name = re.sub(r'(branch|e-auction|sale notice|notice|appendix).*', '', line, flags=re.IGNORECASE).strip()
+            if len(bank_name) > 3:
+                break
+    
+    if not bank_name:
+        b_match = re.search(r'([A-Za-z\s]+(?:Bank|Reconstruction|Finance|ARC|Capital))', full_text, re.IGNORECASE)
+        bank_name = clean_val(b_match.group(1)) if b_match else "Commercial Bank / ARC"
 
-    # Primary Borrower only
+    bank_name = bank_name.upper()
+
+    # 2. Borrower Name (Strictly primary borrower only)
     borrower_name = ""
-    b_match = re.search(r'(?:borrower|name\s*of\s*borrower)s?[:\s\-]+([A-Za-z\.\s]+?)(?=\s*(?:co-borrower|guarantor|legal|mortgagor|\/|\n|rs\.|₹|property))', full_text, re.IGNORECASE)
+    b_match = re.search(r'(?:name\s*of\s*borrower|borrower)s?[:\s\-]+([A-Za-z\.\s]+?)(?=\s*(?:co-borrower|guarantor|legal|mortgagor|\/|\n|rs\.|₹|schedule|property))', full_text, re.IGNORECASE)
     if b_match:
         borrower_name = clean_val(b_match.group(1))
     else:
+        # Extract name directly from standard format file title
         name_part = re.search(r'(?:MrMrs\.|Mr\.|Mrs\.)?([A-Z\s]+?)(?=\s+THE\s+NEW|\s+INDIAN|\.pdf)', filename, re.IGNORECASE)
         borrower_name = clean_val(name_part.group(1)) if name_part else ""
 
-    # Reserve Price
+    # 3. Reserve Price
     rp_match = re.search(r'(?:reserve\s*price|r\.?p\.?)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
     reserve_price = clean_val(rp_match.group(1)) if rp_match else ""
 
-    # Dates & Times
+    # 4. Dates & Times Extraction
     dates = re.findall(r'(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})', full_text)
     times = re.findall(r'(\d{1,2}[:\.]\d{2}\s*(?:am|pm|a\.m\.|p\.m\.|hours|hrs)?)', full_text, re.IGNORECASE)
 
@@ -82,9 +105,9 @@ def parse_auction_fields(full_text, filename):
     auction_start_time = clean_val(times[1]) if len(times) > 1 else ""
     auction_end_time = clean_val(times[2]) if len(times) > 2 else ""
 
-    # Property Description
-    prop_match = re.search(r'(?:description\s*of\s*(?:the\s*)?property|schedule\s*of\s*property|property\s*details)[^\n]*\n([\s\S]{50,400})', full_text, re.IGNORECASE)
-    prop_desc = clean_val(prop_match.group(1)) if prop_match else clean_val(full_text[:300])
+    # 5. Property Description
+    prop_match = re.search(r'(?:description\s*of\s*(?:the\s*)?property|schedule\s*of\s*(?:immovable\s*)?property|property\s*details)[^\n]*\n([\s\S]{50,450})', full_text, re.IGNORECASE)
+    prop_desc = clean_val(prop_match.group(1)) if prop_match else clean_val(full_text[:350])
 
     row = {
         "Notice File": filename,
@@ -117,7 +140,8 @@ def process_single_pdf(file_bytes, filename):
             crop_box = get_notice_crop_box(page)
             temp_doc = fitz.open()
             temp_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            temp_doc[0].set_cropbox(crop_box)
+            p = temp_doc[0]
+            p.set_cropbox(crop_box)
             cut_doc.insert_pdf(temp_doc)
             temp_doc.close()
 
@@ -133,15 +157,17 @@ def process_single_pdf(file_bytes, filename):
     cut_doc.close()
     doc.close()
 
+    # Dynamic Bank Excel Generation
     bank_name, rows = parse_auction_fields(full_text, filename)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        sheet = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30] or "Sheet1"
+        sheet = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30] or "Notice Data"
         pd.DataFrame(rows).to_excel(writer, sheet_name=sheet, index=False)
     excel_bytes = output.getvalue()
 
     return base_name, cut_pdf_bytes, excel_bytes, rows
 
+# --- Streamlit UI ---
 uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
