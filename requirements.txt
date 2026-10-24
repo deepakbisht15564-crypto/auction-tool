@@ -1,5 +1,6 @@
 streamlit
-pymupdf
-openpyxl
+PyMuPDF
 pandas
-google-genai
+openpyxl
+groq
+
