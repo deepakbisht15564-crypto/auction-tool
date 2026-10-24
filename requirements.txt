@@ -1,7 +1,4 @@
 streamlit
 PyMuPDF
-opencv-python-headless
 pandas
 openpyxl
-pillow
-google-genai
