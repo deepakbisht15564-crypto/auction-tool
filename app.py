@@ -8,7 +8,7 @@ import pandas as pd
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("📄 Bulk E-Auction PDF Processor")
-st.write("Vector Quality Box Cuttings + Complete Field-Wise Excel Extraction.")
+st.write("Clean Box Cuttings + Field-Wise Excel Extraction.")
 
 def clean_val(text):
     if not text:
@@ -17,7 +17,7 @@ def clean_val(text):
     return re.sub(r'[\r\n\t]+', ' ', cleaned).strip()
 
 def get_precise_notice_box(page):
-    keywords = ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price", "earnest money", "description of property"]
+    keywords = ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price", "earnest money", "description"]
     rects = []
     for kw in keywords:
         matches = page.search_for(kw)
@@ -44,46 +44,28 @@ def parse_notice_data(full_text, filename):
     # 1. Exact Bank / ARC Name Detection
     bank_name = ""
     for line in lines[:25]:
-        upper_line = line.upper()
-        if "ARCIL" in upper_line or "ASSET RECONSTRUCTION" in upper_line:
+        u = line.upper()
+        if "ARCIL" in u or "ASSET RECONSTRUCTION" in u:
             bank_name = "ARCIL"
             break
-        elif "STATE BANK" in upper_line or "SBI" in upper_line:
+        elif "STATE BANK" in u or "SBI" in u:
             bank_name = "STATE BANK OF INDIA"
             break
-        elif "HDFC" in upper_line:
+        elif "HDFC" in u:
             bank_name = "HDFC BANK"
             break
-        elif "ICICI" in upper_line:
+        elif "ICICI" in u:
             bank_name = "ICICI BANK"
             break
-        elif "CANARA" in upper_line:
+        elif "CANARA" in u:
             bank_name = "CANARA BANK"
             break
-        elif "PUNJAB NATIONAL" in upper_line or "PNB" in upper_line:
+        elif "PUNJAB NATIONAL" in u or "PNB" in u:
             bank_name = "PUNJAB NATIONAL BANK"
             break
-        elif "BANK OF BARODA" in upper_line or "BOB" in upper_line:
+        elif "BANK OF BARODA" in u or "BOB" in u:
             bank_name = "BANK OF BARODA"
             break
-        elif "INDIAN BANK" in upper_line:
+        elif "INDIAN BANK" in u:
             bank_name = "INDIAN BANK"
             break
-        elif "AXIS" in upper_line:
-            bank_name = "AXIS BANK"
-            break
-        elif "KOTAK" in upper_line:
-            bank_name = "KOTAK MAHINDRA BANK"
-            break
-        elif "BANK" in upper_line:
-            bank_name = line.split("BRANCH")[0].split("NOTICE")[0].strip()
-            if len(bank_name) > 3:
-                break
-    
-    if not bank_name:
-        bank_name = "ARCIL" if "arcil" in full_text.lower() else "BANK NOTICE"
-    bank_name = bank_name.upper()
-
-    # 2. Borrower Name (Strictly only the primary borrower)
-    borrower_name = ""
-    name_match = re.search(r'(?:MrMrs\.|Mr\.|Mrs\.)?([A-Z\s]+?)(?=\s+THE\s+NEW|\s+INDIAN|\.pdf)', filename, re.IGNORECASE
