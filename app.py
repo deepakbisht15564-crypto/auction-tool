@@ -15,8 +15,8 @@ st.set_page_config(
     page_title="Bulk E-Auction Notice Processor",
     layout="wide"
 )
-st.title("📄 Bulk E-Auction PDF Processor")
-st.write("Clean Box Cutting + 9-Column Multi-Sheet Excel.")
+st.title("Bulk E-Auction PDF Processor")
+st.write("Full Original Page PDF + Bank-Named Multi-Sheet Excel.")
 
 api_key = st.sidebar.text_input(
     "Enter Gemini API Key",
@@ -42,57 +42,26 @@ def clean_prop(text):
     c = clean_val(text)
     return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', c).strip()
 
-def get_notice_box(page):
-    anchors = [
-        "sale notice", "e-auction", "sarfaesi",
-        "arcil", "reserve price", "authorised officer"
-    ]
-    hits = []
-    for a in anchors:
-        r = page.search_for(a)
-        if r:
-            hits.extend(r)
-    if hits:
-        min_x = min(h.x0 for h in hits)
-        min_y = min(h.y0 for h in hits)
-        max_x = max(h.x1 for h in hits)
-        max_y = max(h.y1 for h in hits)
-        return fitz.Rect(
-            max(0, min_x - 15),
-            max(0, min_y - 25),
-            min(page.rect.width, max_x + 15),
-            min(page.rect.height, max_y + 35)
-        )
-    return fitz.Rect(
-        page.rect.width * 0.30,
-        page.rect.height * 0.45,
-        page.rect.width,
-        page.rect.height
-    )
-
-def extract_with_ai(client, page, box):
-    pix = page.get_pixmap(clip=box, dpi=200)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    
+def extract_with_ai(client, pil_image):
     prompt = """
-    Extract all Bank / ARC E-Auction Sale Notices from this image.
-    Return ONLY a JSON list of objects with these exact keys:
-    - "bank_or_arc_name": Exact Bank or ARC name (e.g. Arcil, SBI, etc.)
+    Look at this newspaper page and extract all details from the Bank / ARC E-Auction / SARFAESI Sale Notice.
+    Return ONLY a strict JSON list of objects with these exact keys:
+    - "bank_or_arc_name": Exact Bank or ARC name (e.g. Arcil, State Bank of India, Indian Bank, Canara Bank, etc.)
     - "account_prospect_no": Account / Loan / NPA number
-    - "borrower_name": ONLY Primary Borrower Name. Exclude Co-Borrowers/Guarantors.
+    - "borrower_name": ONLY Primary Borrower Name. Strictly exclude Co-Borrowers, Guarantors, and Mortgagors.
     - "property_description": Property details & schedule
-    - "reserve_price": Reserve Price with currency
+    - "reserve_price": Reserve Price with currency (e.g. Rs. 25,00,000)
     - "emd_amount": EMD Amount with currency
     - "inspection_date_time": Inspection Date & Time
     - "emd_last_date_time": EMD Last Date & Time
     - "auction_date_time": Auction Date & Time
     """
-    
+
     for attempt in range(3):
         try:
             resp = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[prompt, img],
+                model="gemini-2.5-flash",
+                contents=[prompt, pil_image],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.0
@@ -103,6 +72,7 @@ def extract_with_ai(client, page, box):
                 raw = raw[7:-3].strip()
             elif raw.startswith("```"):
                 raw = raw[3:-3].strip()
+
             data = json.loads(raw)
             if isinstance(data, dict) and "notices" in data:
                 return data["notices"]
@@ -116,38 +86,42 @@ def extract_with_ai(client, page, box):
 def process_pdf(file_bytes, filename, client):
     base = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    
+
+    # Find the exact page containing sale notice
     t_idx = 0
     for idx, page in enumerate(doc):
         txt = page.get_text().lower()
-        if any(w in txt for w in ["sale", "auction", "sarfaesi", "arcil"]):
+        if any(w in txt for w in ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price"]):
             t_idx = idx
             break
-            
-    page = doc[t_idx]
-    box = get_notice_box(page)
-    
-    # 1. High-resolution Vector Cutting PDF
-    cut_doc = fitz.open()
-    cut_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
-    cut_doc[0].set_cropbox(box)
-    pdf_bytes = cut_doc.write()
-    cut_doc.close()
-    
-    # 2. Vision Extraction
-    records = extract_with_ai(client, page, box)
+
+    # 1. Pura Original HD Page (Zero Crop, No Cutting, Zero Pixel Loss)
+    full_doc = fitz.open()
+    full_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
+    pdf_bytes = full_doc.write()
+    full_doc.close()
+
+    # 2. Render Page for AI Vision
+    target_page = doc[t_idx]
+    pix = target_page.get_pixmap(dpi=200)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
     doc.close()
-    
-    # 3. Dedicated Excel Generation (Bank Tabs + 9 Columns)
+
+    # 3. AI Vision Extraction
+    records = extract_with_ai(client, img)
+
+    # 4. Excel Generation: Sheet Rename to Bank Name
     bank_groups = {}
     master_recs = []
-    
+
     for idx, r in enumerate(records, start=1):
-        bank = clean_val(r.get("bank_or_arc_name", "OTHERS")).upper()
-        sheet = re.sub(r'[\\/*?:\[\]]', '', bank)[:30].strip() or "Notice Data"
-        
+        raw_bank = clean_val(r.get("bank_or_arc_name", "BANK NOTICE")).upper()
+        # Excel sheet name limit 30 chars and no special chars
+        clean_sheet = re.sub(r'[\\/*?:\[\]]', '', raw_bank)[:30].strip() or "NOTICE DATA"
+
         row_dict = {
             "S.No.": idx,
+            "Bank / ARC": raw_bank,
             "Account / Prospect No.": clean_val(r.get("account_prospect_no", "")),
             "Borrower(s) Name": clean_val(r.get("borrower_name", "")),
             "Property Description": clean_prop(r.get("property_description", "")),
@@ -157,21 +131,20 @@ def process_pdf(file_bytes, filename, client):
             "EMD Last Date & Time": clean_val(r.get("emd_last_date_time", "")),
             "Auction Date & Time": clean_val(r.get("auction_date_time", ""))
         }
-        bank_groups.setdefault(sheet, []).append(row_dict)
-        
+        bank_groups.setdefault(clean_sheet, []).append(row_dict)
+
         m_row = dict(row_dict)
         m_row["Source_File"] = filename
-        m_row["Bank_or_ARC"] = bank
         master_recs.append(m_row)
-        
+
     excel_bytes = None
     if bank_groups:
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
-            for s_name, rows in bank_groups.items():
-                pd.DataFrame(rows).to_excel(writer, sheet_name=s_name, index=False)
+            for sheet_name, rows in bank_groups.items():
+                pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
         excel_bytes = out.getvalue()
-        
+
     return base, pdf_bytes, excel_bytes, master_recs
 
 if start_btn:
@@ -183,37 +156,36 @@ if start_btn:
         client = genai.Client(api_key=api_key)
         prog = st.progress(0)
         status = st.empty()
-        
+
         zip_buf = io.BytesIO()
         total = len(uploaded_files)
         all_master = []
-        
+
         with zipfile.ZipFile(zip_buf, "w") as zf:
             for i, f in enumerate(uploaded_files):
                 status.text(f"Processing ({i+1}/{total}): {f.name}")
-                base, c_pdf, x_data, m_rows = process_pdf(f.getvalue(), f.name, client)
-                
-                if c_pdf:
-                    zf.writestr(f"{base}/{base}_Cutting.pdf", c_pdf)
+                base, p_pdf, x_data, m_rows = process_pdf(f.getvalue(), f.name, client)
+
+                if p_pdf:
+                    zf.writestr(f"{base}/{base}_FullPage.pdf", p_pdf)
                 if x_data:
                     zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
                 if m_rows:
                     all_master.extend(m_rows)
-                    
+
                 prog.progress((i + 1) / total)
-                
+
             if all_master:
                 m_df = pd.DataFrame(all_master)
                 zf.writestr(
                     "CRM_All_Accounts_Master.csv",
                     m_df.to_csv(index=False).encode('utf-8')
                 )
-                
+
         status.success("All Done!")
         st.download_button(
-            label="📥 Download All Deliverables (ZIP)",
+            label="Download All Deliverables (ZIP)",
             data=zip_buf.getvalue(),
             file_name="Processed_Auctions.zip",
             mime="application/zip"
         )
-        
