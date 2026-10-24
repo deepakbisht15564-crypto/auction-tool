@@ -1,22 +1,23 @@
 import streamlit as st
 import os
 import re
-import json
 import zipfile
 import io
-import time
 import fitz
 import pandas as pd
-from PIL import Image
-from google import genai
-from google.genai import types
 
-st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
+st.set_page_config(
+    page_title="Bulk E-Auction Notice Processor",
+    layout="wide"
+)
 st.title("Bulk E-Auction PDF Processor")
-st.write("Full Page (Zero Crop) + Bank Named Excel Sheets.")
+st.write("Full Uncut Page PDF + Bank-Named Excel Sheets.")
 
-api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
-uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload Auction PDFs (Bulk)",
+    type=["pdf"],
+    accept_multiple_files=True
+)
 start_btn = st.button("Start Processing")
 
 def clean_val(text):
@@ -31,120 +32,137 @@ def clean_prop(text):
     c = clean_val(text)
     return re.sub(r'[^a-zA-Z0-9\s.,]', ' ', c).strip()
 
-def extract_with_ai(client, pil_image):
-    prompt = """
-    Look at this newspaper page image carefully.
-    Find the E-Auction / SARFAESI Sale Notice and extract all details into a strict JSON list of objects:
-    - "bank_or_arc_name": Exact Bank or ARC name (e.g. Arcil, State Bank of India, Indian Bank, Canara Bank, etc.)
-    - "account_prospect_no": Account / Loan / NPA number
-    - "borrower_name": ONLY Primary Borrower Name. Strictly exclude Co-Borrowers, Guarantors, and Mortgagors.
-    - "property_description": Property details & schedule
-    - "reserve_price": Reserve Price with currency (e.g. Rs. 25,00,000)
-    - "emd_amount": EMD Amount with currency
-    - "inspection_date_time": Inspection Date & Time
-    - "emd_last_date_time": EMD Last Date & Time
-    - "auction_date_time": Auction Date & Time
-    """
+def extract_bank_name(lines, full_text):
+    for line in lines[:35]:
+        u = line.upper()
+        if "ARCIL" in u or "ASSET RECONSTRUCTION" in u:
+            return "ARCIL"
+        elif "STATE BANK OF INDIA" in u or "SBI" in u:
+            return "STATE BANK OF INDIA"
+        elif "CANARA BANK" in u:
+            return "CANARA BANK"
+        elif "PUNJAB NATIONAL BANK" in u or "PNB" in u:
+            return "PUNJAB NATIONAL BANK"
+        elif "BANK OF BARODA" in u or "BOB" in u:
+            return "BANK OF BARODA"
+        elif "INDIAN BANK" in u:
+            return "INDIAN BANK"
+        elif "UNION BANK" in u:
+            return "UNION BANK OF INDIA"
+        elif "HDFC BANK" in u:
+            return "HDFC BANK"
+        elif "ICICI BANK" in u:
+            return "ICICI BANK"
+        elif "AXIS BANK" in u:
+            return "AXIS BANK"
+        elif "KOTAK MAHINDRA" in u:
+            return "KOTAK MAHINDRA BANK"
+        elif "BANK" in u:
+            candidate = u.split("BRANCH")[0].split("NOTICE")[0].strip()
+            if len(candidate) > 4:
+                return candidate
+    return "ARCIL" if "arcil" in full_text.lower() else "BANK NOTICE"
 
-    for attempt in range(3):
-        try:
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[prompt, pil_image],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0
-                )
-            )
-            raw = resp.text.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:-3].strip()
-            elif raw.startswith("```"):
-                raw = raw[3:-3].strip()
+def extract_borrower(filename, lines):
+    clean_fn = filename.replace("_Cutting", "").replace(".pdf", "")
+    tokens = [w for w in clean_fn.split() if not any(c.isdigit() for c in w)]
+    filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION", "SALE"]
+    clean_tokens = [w for w in tokens if w.upper() not in filter_words]
+    if clean_tokens:
+        b_name = " ".join(clean_tokens)
+        return b_name.replace("MrMrs.", "").replace("Mr.", "").replace("Mrs.", "").strip()
 
-            data = json.loads(raw)
-            if isinstance(data, dict) and "notices" in data:
-                return data["notices"]
-            elif isinstance(data, list):
-                return data
-            return [data]
-        except Exception:
-            time.sleep(2)
-    return []
+    for line in lines:
+        if "borrower" in line.lower():
+            val = line.split(":")[-1]
+            val = val.split("/")[0].split("Co-")[0].strip()
+            if len(val) > 2:
+                return clean_val(val)
+    return "N/A"
 
-def process_pdf(file_bytes, filename, client):
-    base = os.path.splitext(filename)[0]
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-
-    # Find the sale notice page
-    target_idx = 0
+def parse_notice_document(doc, filename):
+    t_idx = 0
     for idx in range(len(doc)):
         txt = doc[idx].get_text().lower()
         if any(w in txt for w in ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price"]):
-            target_idx = idx
+            t_idx = idx
             break
 
-    # Pura Original Page (NO CROP - ZERO CUTTING)
+    target_page = doc[t_idx]
+
+    full_rect = target_page.rect
+    target_page.set_cropbox(full_rect)
+    target_page.set_mediabox(full_rect)
+
     full_doc = fitz.open()
-    full_doc.insert_pdf(doc, from_page=target_idx, to_page=target_idx)
-    # Ensure standard page boundaries
-    orig_rect = doc[target_idx].rect
-    full_doc[0].set_cropbox(orig_rect)
-    full_doc[0].set_mediabox(orig_rect)
+    full_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
+    full_doc[0].set_cropbox(full_rect)
+    full_doc[0].set_mediabox(full_rect)
     pdf_bytes = full_doc.write()
     full_doc.close()
 
-    # High-Res Render for AI
-    target_page = doc[target_idx]
-    pix = target_page.get_pixmap(dpi=200)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    doc.close()
+    full_text = target_page.get_text()
+    lines = [clean_val(l) for l in full_text.split("\n") if clean_val(l)]
 
-    records = extract_with_ai(client, img)
+    bank_name = extract_bank_name(lines, full_text).upper()
+    borrower = extract_borrower(filename, lines)
 
-    # Excel Generation (Sheets named by Bank/ARC)
-    bank_groups = {}
-    master_recs = []
+    amounts = re.findall(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)', full_text, re.I)
+    if not amounts:
+        amounts = re.findall(r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b', full_text)
 
-    for idx, r in enumerate(records, start=1):
-        raw_bank = clean_val(r.get("bank_or_arc_name", "BANK NOTICE")).upper()
-        clean_sheet = re.sub(r'[\\/*?:\[\]]', '', raw_bank)[:30].strip() or "NOTICE DATA"
+    reserve_price = f"Rs. {clean_val(amounts[0])}" if len(amounts) >= 1 else ""
+    emd_amount = f"Rs. {clean_val(amounts[1])}" if len(amounts) >= 2 else ""
 
-        row_dict = {
-            "S.No.": idx,
-            "Bank / ARC": raw_bank,
-            "Account / Prospect No.": clean_val(r.get("account_prospect_no", "")),
-            "Borrower(s) Name": clean_val(r.get("borrower_name", "")),
-            "Property Description": clean_prop(r.get("property_description", "")),
-            "Reserve Price": clean_val(r.get("reserve_price", "")),
-            "EMD Amount": clean_val(r.get("emd_amount", "")),
-            "Inspection Date & Time": clean_val(r.get("inspection_date_time", "")),
-            "EMD Last Date & Time": clean_val(r.get("emd_last_date_time", "")),
-            "Auction Date & Time": clean_val(r.get("auction_date_time", ""))
-        }
-        bank_groups.setdefault(clean_sheet, []).append(row_dict)
+    dates = re.findall(r'\b\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4}\b', full_text)
+    times = re.findall(r'\b\d{1,2}[:\.]\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.|hrs|hours)?\b', full_text, re.I)
 
-        m_row = dict(row_dict)
-        m_row["Source_File"] = filename
-        master_recs.append(m_row)
+    emd_last_date = dates[0] if len(dates) > 0 else ""
+    auction_date = dates[1] if len(dates) > 1 else emd_last_date
 
-    excel_bytes = None
-    if bank_groups:
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine='openpyxl') as writer:
-            for sheet_name, rows in bank_groups.items():
-                pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
-        excel_bytes = out.getvalue()
+    emd_last_time = clean_val(times[0]) if len(times) > 0 else "05:00 PM"
+    auction_time = clean_val(times[1]) if len(times) > 1 else "11:00 AM - 12:00 PM"
 
-    return base, pdf_bytes, excel_bytes, master_recs
+    prop_desc = ""
+    for idx, line in enumerate(lines):
+        if any(kw in line.lower() for kw in ["property", "schedule", "immovable", "piece and parcel"]):
+            prop_desc = " ".join(lines[idx:idx+4])
+            break
+    if not prop_desc:
+        mid = len(lines) // 2
+        prop_desc = " ".join(lines[mid:mid+4]) if lines else "Full notice details available on attached PDF."
+
+    acct_match = re.findall(r'\b[A-Z0-9]{8,20}\b', filename)
+    acct_no = acct_match[0] if acct_match else ""
+
+    row_data = {
+        "S.No.": 1,
+        "Bank / ARC": bank_name,
+        "Account / Prospect No.": acct_no,
+        "Borrower(s) Name": borrower,
+        "Property Description": clean_prop(prop_desc),
+        "Reserve Price": reserve_price,
+        "EMD Amount": emd_amount,
+        "Inspection Date & Time": "As per notice terms",
+        "EMD Last Date & Time": f"{emd_last_date} {emd_last_time}".strip(),
+        "Auction Date & Time": f"{auction_date} {auction_time}".strip()
+    }
+
+    clean_sheet = re.sub(r'[\\/*?:\[\]]', '', bank_name)[:30].strip() or "NOTICE DATA"
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        pd.DataFrame([row_data]).to_excel(writer, sheet_name=clean_sheet, index=False)
+    excel_bytes = out.getvalue()
+
+    master_row = dict(row_data)
+    master_row["Source_File"] = filename
+
+    return pdf_bytes, excel_bytes, [master_row]
 
 if start_btn:
-    if not api_key:
-        st.error("Please enter Gemini API Key in the sidebar!")
-    elif not uploaded_files:
+    if not uploaded_files:
         st.warning("Please upload auction PDF files!")
     else:
-        client = genai.Client(api_key=api_key)
         prog = st.progress(0)
         status = st.empty()
 
@@ -155,10 +173,13 @@ if start_btn:
         with zipfile.ZipFile(zip_buf, "w") as zf:
             for i, f in enumerate(uploaded_files):
                 status.text(f"Processing ({i+1}/{total}): {f.name}")
-                base, p_pdf, x_data, m_rows = process_pdf(f.getvalue(), f.name, client)
+                base = os.path.splitext(f.name)[0]
+                doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+
+                p_pdf, x_data, m_rows = parse_notice_document(doc, f.name)
+                doc.close()
 
                 if p_pdf:
-                    # Naya file name taaki purana cached file load na ho
                     zf.writestr(f"{base}/{base}_Complete_Page.pdf", p_pdf)
                 if x_data:
                     zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
@@ -176,7 +197,7 @@ if start_btn:
 
         status.success("All Done!")
         st.download_button(
-            label="Download All Deliverables (ZIP)",
+            label="📥 Download All Deliverables (ZIP)",
             data=zip_buf.getvalue(),
             file_name="Processed_Auctions.zip",
             mime="application/zip"
