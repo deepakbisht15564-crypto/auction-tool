@@ -11,23 +11,12 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-st.set_page_config(
-    page_title="Bulk E-Auction Notice Processor",
-    layout="wide"
-)
+st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("Bulk E-Auction PDF Processor")
-st.write("Full Original Page PDF + Bank-Named Multi-Sheet Excel.")
+st.write("Full Page (Zero Crop) + Bank Named Excel Sheets.")
 
-api_key = st.sidebar.text_input(
-    "Enter Gemini API Key",
-    type="password"
-)
-
-uploaded_files = st.file_uploader(
-    "Upload Auction PDFs (Bulk)",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
+uploaded_files = st.file_uploader("Upload Auction PDFs (Bulk)", type=["pdf"], accept_multiple_files=True)
 start_btn = st.button("Start Processing")
 
 def clean_val(text):
@@ -44,8 +33,8 @@ def clean_prop(text):
 
 def extract_with_ai(client, pil_image):
     prompt = """
-    Look at this newspaper page and extract all details from the Bank / ARC E-Auction / SARFAESI Sale Notice.
-    Return ONLY a strict JSON list of objects with these exact keys:
+    Look at this newspaper page image carefully.
+    Find the E-Auction / SARFAESI Sale Notice and extract all details into a strict JSON list of objects:
     - "bank_or_arc_name": Exact Bank or ARC name (e.g. Arcil, State Bank of India, Indian Bank, Canara Bank, etc.)
     - "account_prospect_no": Account / Loan / NPA number
     - "borrower_name": ONLY Primary Borrower Name. Strictly exclude Co-Borrowers, Guarantors, and Mortgagors.
@@ -87,36 +76,38 @@ def process_pdf(file_bytes, filename, client):
     base = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    # Find the exact page containing sale notice
-    t_idx = 0
-    for idx, page in enumerate(doc):
-        txt = page.get_text().lower()
+    # Find the sale notice page
+    target_idx = 0
+    for idx in range(len(doc)):
+        txt = doc[idx].get_text().lower()
         if any(w in txt for w in ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price"]):
-            t_idx = idx
+            target_idx = idx
             break
 
-    # 1. Pura Original HD Page (Zero Crop, No Cutting, Zero Pixel Loss)
+    # Pura Original Page (NO CROP - ZERO CUTTING)
     full_doc = fitz.open()
-    full_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
+    full_doc.insert_pdf(doc, from_page=target_idx, to_page=target_idx)
+    # Ensure standard page boundaries
+    orig_rect = doc[target_idx].rect
+    full_doc[0].set_cropbox(orig_rect)
+    full_doc[0].set_mediabox(orig_rect)
     pdf_bytes = full_doc.write()
     full_doc.close()
 
-    # 2. Render Page for AI Vision
-    target_page = doc[t_idx]
+    # High-Res Render for AI
+    target_page = doc[target_idx]
     pix = target_page.get_pixmap(dpi=200)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     doc.close()
 
-    # 3. AI Vision Extraction
     records = extract_with_ai(client, img)
 
-    # 4. Excel Generation: Sheet Rename to Bank Name
+    # Excel Generation (Sheets named by Bank/ARC)
     bank_groups = {}
     master_recs = []
 
     for idx, r in enumerate(records, start=1):
         raw_bank = clean_val(r.get("bank_or_arc_name", "BANK NOTICE")).upper()
-        # Excel sheet name limit 30 chars and no special chars
         clean_sheet = re.sub(r'[\\/*?:\[\]]', '', raw_bank)[:30].strip() or "NOTICE DATA"
 
         row_dict = {
@@ -167,7 +158,8 @@ if start_btn:
                 base, p_pdf, x_data, m_rows = process_pdf(f.getvalue(), f.name, client)
 
                 if p_pdf:
-                    zf.writestr(f"{base}/{base}_FullPage.pdf", p_pdf)
+                    # Naya file name taaki purana cached file load na ho
+                    zf.writestr(f"{base}/{base}_Complete_Page.pdf", p_pdf)
                 if x_data:
                     zf.writestr(f"{base}/{base}_Data.xlsx", x_data)
                 if m_rows:
@@ -189,3 +181,4 @@ if start_btn:
             file_name="Processed_Auctions.zip",
             mime="application/zip"
         )
+        
