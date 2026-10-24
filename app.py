@@ -8,7 +8,7 @@ import pandas as pd
 
 st.set_page_config(page_title="Bulk E-Auction Notice Processor", layout="wide")
 st.title("📄 Bulk E-Auction PDF Processor")
-st.write("100% Offline / No-API Engine — Clean Box Cuttings + Field-Wise Excel Extraction.")
+st.write("Clean Box Cuttings + Field-Wise Excel Extraction.")
 
 def clean_val(text: str) -> str:
     if not text:
@@ -30,7 +30,7 @@ def get_notice_crop_box(page):
         for r in found_rects[1:]:
             bbox |= r
         
-        # Exact auction notice box crop (cuts out left side classifieds/matrimonial)
+        # Exact auction notice crop (left side ads cut out)
         return fitz.Rect(
             max(0, bbox.x0 - 15),
             max(0, bbox.y0 - 20),
@@ -38,13 +38,12 @@ def get_notice_crop_box(page):
             min(page.rect.height, bbox.y1 + 40)
         )
     else:
-        # Fallback to bottom-right quadrant
         return fitz.Rect(page.rect.width * 0.38, page.rect.height * 0.52, page.rect.width, page.rect.height)
 
 def parse_auction_fields(full_text, filename):
     text_lower = full_text.lower()
     
-    # 1. Bank / ARC Name
+    # Bank name
     bank_name = "OTHERS"
     if "arcil" in text_lower or "asset reconstruction" in text_lower:
         bank_name = "ARCIL"
@@ -59,21 +58,20 @@ def parse_auction_fields(full_text, filename):
     elif "punjab national" in text_lower or "pnb" in text_lower:
         bank_name = "PNB"
 
-    # 2. Borrower Name (Strictly only the primary borrower)
+    # Only primary borrower
     borrower_name = ""
     b_match = re.search(r'(?:borrower|name\s*of\s*borrower)s?[:\s\-]+([A-Za-z\.\s]+?)(?=\s*(?:co-borrower|guarantor|legal|mortgagor|\/|\n|rs\.|₹|property))', full_text, re.IGNORECASE)
     if b_match:
         borrower_name = clean_val(b_match.group(1))
     else:
-        # Fallback extraction from filename if notice has table format
         name_part = re.search(r'(?:MrMrs\.|Mr\.|Mrs\.)?([A-Z\s]+?)(?=\s+THE\s+NEW|\s+INDIAN|\.pdf)', filename, re.IGNORECASE)
         borrower_name = clean_val(name_part.group(1)) if name_part else ""
 
-    # 3. Reserve Price
+    # Reserve Price
     rp_match = re.search(r'(?:reserve\s*price|r\.?p\.?)[^\d₹Rs]*([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)', full_text, re.IGNORECASE)
     reserve_price = clean_val(rp_match.group(1)) if rp_match else ""
 
-    # 4. Dates & Times
+    # Dates & Times
     dates = re.findall(r'(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})', full_text)
     times = re.findall(r'(\d{1,2}[:\.]\d{2}\s*(?:am|pm|a\.m\.|p\.m\.|hours|hrs)?)', full_text, re.IGNORECASE)
 
@@ -85,7 +83,7 @@ def parse_auction_fields(full_text, filename):
     auction_start_time = clean_val(times[1]) if len(times) > 1 else ""
     auction_end_time = clean_val(times[2]) if len(times) > 2 else ""
 
-    # 5. Property Description
+    # Property Description
     prop_match = re.search(r'(?:description\s*of\s*(?:the\s*)?property|schedule\s*of\s*property|property\s*details)[^\n]*\n([\s\S]{50,400})', full_text, re.IGNORECASE)
     prop_desc = clean_val(prop_match.group(1)) if prop_match else clean_val(full_text[:300])
 
@@ -108,23 +106,7 @@ def process_single_pdf(file_bytes, filename):
     base_name = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     
-    # 1. Exact Cutting
     cut_doc = fitz.open()
     full_text = ""
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        txt = page.get_text()
-        full_text += txt + "\n"
-        
-        if any(kw in txt.lower() for kw in ["auction", "sale notice", "sarfaesi", "arcil", "reserve price"]):
-            crop_box = get_notice_crop_box(page)
-            temp_doc = fitz.open()
-            temp_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            p = temp_doc[0]
-            p.set_cropbox(crop_box)
-            cut_doc.insert_pdf(temp_doc)
-            temp_doc.close()
-
-    if len(cut_doc) == 0 and len(doc) > 0:
-        crop_box = get
+    for page_num
