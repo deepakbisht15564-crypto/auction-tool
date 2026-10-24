@@ -17,6 +17,18 @@ api_key = st.sidebar.text_input("Enter Groq API Key (starts with gsk_)", type="p
 def clean_text(text: str) -> str:
     return re.sub(r'[\r\n\t]+', ' ', str(text)).strip()
 
+def get_active_model(groq_client):
+    try:
+        models_data = groq_client.models.list()
+        # Find active chat model supported on Groq
+        for m in models_data.data:
+            m_id = m.id.lower()
+            if ("llama" in m_id or "mixtral" in m_id or "gemma" in m_id) and "whisper" not in m_id and "guard" not in m_id:
+                return m.id
+        return models_data.data[0].id
+    except Exception:
+        return "llama-3.1-8b-instant"
+
 def get_notice_crop_box(page):
     keywords = ["arcil", "asset reconstruction", "e-auction", "sale notice", "sarfaesi", "reserve price", "emd"]
     found_rects = []
@@ -39,7 +51,7 @@ def get_notice_crop_box(page):
     else:
         return fitz.Rect(0, page.rect.height * 0.45, page.rect.width, page.rect.height)
 
-def process_single_pdf(file_bytes, filename, groq_client):
+def process_single_pdf(file_bytes, filename, groq_client, active_model):
     base_name = os.path.splitext(filename)[0]
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     
@@ -97,26 +109,19 @@ Return ONLY a valid JSON list of objects: [{{"bank_or_arc_name": "...", ...}}]
 Text:
 {full_text[:30000]}
 """
-        models_to_try = ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
         raw_json = None
-        last_err = ""
-
-        for model_name in models_to_try:
-            try:
-                chat_completion = groq_client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": "You return only pure valid JSON arrays with no markdown or explanation."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    model=model_name,
-                    temperature=0.1
-                )
-                raw_json = chat_completion.choices[0].message.content.strip()
-                if raw_json:
-                    break
-            except Exception as e:
-                last_err = str(e)
-                continue
+        try:
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You return only pure valid JSON arrays with no markdown or explanation."},
+                    {"role": "user", "content": prompt}
+                ],
+                model=active_model,
+                temperature=0.1
+            )
+            raw_json = chat_completion.choices[0].message.content.strip()
+        except Exception as e:
+            st.error(f"Extraction error on {filename} with model {active_model}: {str(e)}")
 
         if raw_json:
             try:
@@ -160,8 +165,6 @@ Text:
                     excel_bytes = output.getvalue()
             except Exception as e:
                 st.error(f"JSON format error on {filename}: {str(e)}")
-        else:
-            st.error(f"Extraction error on {filename}: {last_err}")
 
     doc.close()
     return base_name, cut_pdf_bytes, excel_bytes, all_rows
@@ -173,6 +176,8 @@ if uploaded_files and st.button("Start Processing"):
         st.error("Please enter your Groq API Key in the sidebar!")
     else:
         groq_client = Groq(api_key=api_key)
+        active_model = get_active_model(groq_client)
+        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -182,9 +187,9 @@ if uploaded_files and st.button("Start Processing"):
         
         with zipfile.ZipFile(zip_buffer, "w") as zip_file:
             for idx, file in enumerate(uploaded_files):
-                status_text.text(f"Processing ({idx+1}/{total}): {file.name}")
+                status_text.text(f"Processing ({idx+1}/{total}) using {active_model}: {file.name}")
                 file_data = file.getvalue()
-                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, groq_client)
+                base, cut_pdf, excel_data, rows = process_single_pdf(file_data, file.name, groq_client, active_model)
                 
                 if cut_pdf:
                     zip_file.writestr(f"{base}/{base}_Cutting.pdf", cut_pdf)
