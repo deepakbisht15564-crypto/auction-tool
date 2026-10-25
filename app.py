@@ -71,39 +71,38 @@ def clean_amount(val_str):
         return ""
     return cleaned
 
-def crop_notice_region(page):
-    """Arcil ya kisi bhi sale notice ke area ko locate karke high-res me crop karta hai"""
+def get_optimized_image_b64(page):
+    """
+    Renders notice at optimal resolution (< 1.5MB) to avoid 413 Payload Too Large error
+    """
     pix_w, pix_h = page.rect.width, page.rect.height
-    # Default to middle-bottom half if whole newspaper broadsheet
-    clip_box = fitz.Rect(0, pix_h * 0.25, pix_w, pix_h * 0.98)
-    return page.get_pixmap(dpi=220, clip=clip_box)
+    clip_box = fitz.Rect(0, pix_h * 0.20, pix_w, pix_h * 0.98)
+    
+    # 130 DPI keeps image crisp while payload stays well below Groq 4MB limit
+    pix = page.get_pixmap(dpi=130, clip=clip_box)
+    img_bytes = pix.tobytes("jpeg")
+    return base64.b64encode(img_bytes).decode("utf-8")
 
 def extract_notices_with_groq_vision(groq_client, page):
-    pix = crop_notice_region(page)
-    img_bytes = pix.tobytes("jpeg")
-    b64_img = base64.b64encode(img_bytes).decode("utf-8")
+    b64_img = get_optimized_image_b64(page)
 
     prompt = """
-You are an expert legal data extraction engine. Analyze this high-resolution newspaper auction notice image carefully.
+You are an expert legal data extraction engine. Analyze this newspaper auction notice table image.
 
 CRITICAL INSTRUCTIONS:
-1. Identify the Bank or ARC Name (e.g. Arcil, Cholamandalam, etc.).
-2. There is a multi-row table of defaulted properties/accounts. EXTRACT EVERY SINGLE ROW SEPARATELY. Do not skip any account or borrower.
-3. For EVERY account/property in the table, output a JSON object:
-   - bank_name: The Bank or ARC name.
-   - borrower_name: Primary borrower name in Title Case (strip Mr/Mrs/Shri).
-   - property_description: FULL description as written (Survey No, Natham, Village, Area in Sq Ft, Boundaries North/South/East/West).
-   - reserve_price: Pure number only (no Rs, no comma errors).
-   - emd_amount: Pure number only (no Rs, no dates/years).
-   - inspection_date_time: Inspection date & time or 'As per notice terms'.
+1. Locate the multi-row table of auction properties/accounts (e.g. Arcil, Cholamandalam, etc.).
+2. EXTRACT EVERY ROW SEPARATELY. Do not skip any borrower or property.
+3. For EVERY account row, output a JSON object:
+   - bank_name: Name of Bank or ARC (e.g. Arcil, Cholamandalam).
+   - borrower_name: Primary borrower name in Title Case (no Mr/Mrs/Shri). Strip co-borrowers.
+   - property_description: Complete schedule of property (Survey No, Natham, Village, Area, Boundaries North/South/East/West).
+   - reserve_price: Pure numbers only (e.g. 1151688). No Rs symbol.
+   - emd_amount: Pure numbers only (e.g. 115169). No year numbers like 2026.
+   - inspection_date_time: Inspection date/time or 'As per notice terms'.
    - emd_last_date_time: Last date & time for EMD.
    - auction_date_time: Date and time of auction.
 
-Return ONLY a pure valid JSON array of objects. Example:
-[
-  {"bank_name": "Arcil", "borrower_name": "Krishnan", "property_description": "...", "reserve_price": "933694", "emd_amount": "93369", ...},
-  {"bank_name": "Arcil", "borrower_name": "Parmala Devi", "property_description": "...", "reserve_price": "781575", "emd_amount": "78157", ...}
-]
+Return ONLY a pure valid JSON array of objects.
 """
     try:
         res = groq_client.chat.completions.create(
@@ -136,7 +135,7 @@ Return ONLY a pure valid JSON array of objects. Example:
             return data
         return [data]
     except Exception as e:
-        st.error(f"Vision API Error: {str(e)}")
+        st.error(f"Vision API Warning: {str(e)}")
         return []
 
 def style_excel_worksheet(ws):
@@ -224,60 +223,8 @@ def process_single_pdf(file_bytes, filename, groq_client):
         m_row["Source_File"] = filename
         master_records.append(m_row)
 
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine='openpyxl') as writer:
-        for sheet_title, rows in bank_sheets.items():
-            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_title, index=False)
-            ws = writer.sheets[sheet_title]
-            style_excel_worksheet(ws)
-
-    excel_bytes = out.getvalue()
-    return pdf_bytes, excel_bytes, master_records
-
-if start_btn:
-    if not api_key:
-        st.error("Please enter your Groq API Key (starts with gsk_) in the sidebar!")
-    elif not uploaded_files:
-        st.warning("Please upload auction PDF files!")
-    else:
-        groq_client = Groq(api_key=api_key)
-        prog = st.progress(0)
-        status = st.empty()
-
-        zip_buf = io.BytesIO()
-        total = len(uploaded_files)
-        all_master = []
-
-        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for i, f in enumerate(uploaded_files):
-                status.text(f"Processing ({i+1}/{total}): {f.name}")
-                base = os.path.splitext(f.name)[0]
-
-                p_pdf, x_data, m_rows = process_single_pdf(f.getvalue(), f.name, groq_client)
-
-                if p_pdf:
-                    zf.writestr(f"{base}_Complete_Page.pdf", p_pdf)
-                if x_data:
-                    zf.writestr(f"{base}_Data.xlsx", x_data)
-                if m_rows:
-                    all_master.extend(m_rows)
-
-                prog.progress((i + 1) / total)
-
-            if all_master:
-                m_df = pd.DataFrame(all_master)
-                zf.writestr(
-                    "CRM_All_Accounts_Master.csv",
-                    m_df.to_csv(index=False).encode('utf-8')
-                )
-
-        zip_buf.seek(0)
-        final_zip = zip_buf.getvalue()
-
-        status.success("All Done!")
-        st.download_button(
-            label="Download All Deliverables (ZIP)",
-            data=final_zip,
-            file_name="Processed_Auctions.zip",
-            mime="application/zip"
-        )
+    # Bulletproof fallback so bank_sheets is never empty
+    if not bank_sheets:
+        clean_fn = filename.replace("_Cutting", "").replace(".pdf", "").replace("-", " ")
+        tokens = [w for w in clean_fn.split() if not any(c.isdigit() for c in w)]
+        filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION", "SALE", "AUCTION"]
