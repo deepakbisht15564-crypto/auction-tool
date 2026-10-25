@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 st.title("Bulk E-Auction PDF Processor")
-st.write("ExtractFox-Grade Vision Engine: Scanned Newspapers to Clean Corporate Excel.")
+st.write("ExtractFox-Grade Vision Engine: Multi-Row Table Extraction.")
 
 api_key = st.sidebar.text_input(
     "Enter Groq API Key (starts with gsk_)",
@@ -71,29 +71,39 @@ def clean_amount(val_str):
         return ""
     return cleaned
 
+def crop_notice_region(page):
+    """Arcil ya kisi bhi sale notice ke area ko locate karke high-res me crop karta hai"""
+    pix_w, pix_h = page.rect.width, page.rect.height
+    # Default to middle-bottom half if whole newspaper broadsheet
+    clip_box = fitz.Rect(0, pix_h * 0.25, pix_w, pix_h * 0.98)
+    return page.get_pixmap(dpi=220, clip=clip_box)
+
 def extract_notices_with_groq_vision(groq_client, page):
-    # Render PDF page to high-res JPEG image for Vision OCR
-    pix = page.get_pixmap(dpi=150)
+    pix = crop_notice_region(page)
     img_bytes = pix.tobytes("jpeg")
     b64_img = base64.b64encode(img_bytes).decode("utf-8")
 
     prompt = """
-You are an expert financial auditor extracting Bank & ARC E-Auction Sale Notices from a scanned newspaper page image.
+You are an expert legal data extraction engine. Analyze this high-resolution newspaper auction notice image carefully.
 
-CRITICAL RULES:
-1. Ignore general news, electricity tenders, politics, municipal tenders, and non-auction advertisements.
-2. Locate all E-Auction / Sale Notices (e.g. Arcil, Cholamandalam, ICICI Bank, SBI, HDFC, etc.).
-3. Extract each property row into a JSON object:
-   - bank_or_arc_name: Name of Bank or ARC (e.g., Arcil, Cholamandalam, etc.).
-   - borrower_name: Primary Borrower ONLY in Title Case (no Mr/Mrs/Shri). Co-borrowers strip out.
-   - property_description: Complete schedule of property (Survey No, village, carpet area, boundaries) as-it-is.
-   - reserve_price: Clean numeric amount (e.g. 1151688). No Rs, no currency symbols.
-   - emd_amount: Clean numeric amount (e.g. 115169). No years like 2026.
-   - inspection_date_time: Inspection date/time or 'As per notice terms'.
-   - emd_last_date_time: Last date and time for EMD submission.
+CRITICAL INSTRUCTIONS:
+1. Identify the Bank or ARC Name (e.g. Arcil, Cholamandalam, etc.).
+2. There is a multi-row table of defaulted properties/accounts. EXTRACT EVERY SINGLE ROW SEPARATELY. Do not skip any account or borrower.
+3. For EVERY account/property in the table, output a JSON object:
+   - bank_name: The Bank or ARC name.
+   - borrower_name: Primary borrower name in Title Case (strip Mr/Mrs/Shri).
+   - property_description: FULL description as written (Survey No, Natham, Village, Area in Sq Ft, Boundaries North/South/East/West).
+   - reserve_price: Pure number only (no Rs, no comma errors).
+   - emd_amount: Pure number only (no Rs, no dates/years).
+   - inspection_date_time: Inspection date & time or 'As per notice terms'.
+   - emd_last_date_time: Last date & time for EMD.
    - auction_date_time: Date and time of auction.
 
-Return ONLY a pure valid JSON array of objects. No markdown formatting.
+Return ONLY a pure valid JSON array of objects. Example:
+[
+  {"bank_name": "Arcil", "borrower_name": "Krishnan", "property_description": "...", "reserve_price": "933694", "emd_amount": "93369", ...},
+  {"bank_name": "Arcil", "borrower_name": "Parmala Devi", "property_description": "...", "reserve_price": "781575", "emd_amount": "78157", ...}
+]
 """
     try:
         res = groq_client.chat.completions.create(
@@ -125,7 +135,8 @@ Return ONLY a pure valid JSON array of objects. No markdown formatting.
         elif isinstance(data, list):
             return data
         return [data]
-    except Exception:
+    except Exception as e:
+        st.error(f"Vision API Error: {str(e)}")
         return []
 
 def style_excel_worksheet(ws):
@@ -174,7 +185,6 @@ def process_single_pdf(file_bytes, filename, groq_client):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     target_page = doc[0]
 
-    # Full page unclipped export
     full_rect = target_page.rect
     target_page.set_cropbox(full_rect)
     target_page.set_mediabox(full_rect)
@@ -186,7 +196,6 @@ def process_single_pdf(file_bytes, filename, groq_client):
     pdf_bytes = full_doc.write()
     full_doc.close()
 
-    # Vision OCR via Groq
     extracted = extract_notices_with_groq_vision(groq_client, target_page)
     doc.close()
 
@@ -194,7 +203,7 @@ def process_single_pdf(file_bytes, filename, groq_client):
     master_records = []
 
     for item in extracted:
-        raw_bank = clean_val(item.get("bank_or_arc_name", "ARCIL")).upper()
+        raw_bank = clean_val(item.get("bank_name", "ARCIL")).upper()
         clean_sheet = re.sub(r'[\\/*?:\[\]]', '', raw_bank)[:25].strip() or "NOTICE DATA"
 
         row_dict = {
@@ -214,19 +223,6 @@ def process_single_pdf(file_bytes, filename, groq_client):
         m_row = dict(row_dict)
         m_row["Source_File"] = filename
         master_records.append(m_row)
-
-    if not bank_sheets:
-        bank_sheets["AUCTION NOTICE"] = [{
-            "S.No.": 1,
-            "Bank Name": "ARCIL",
-            "Borrower(s) Name": "Pattamuthu K",
-            "Property Description": "Refer attached high resolution page",
-            "Reserve Price": "1151688",
-            "EMD Amount": "115169",
-            "Inspection Date & Time": "As per notice terms",
-            "EMD Last Date & Time": "07-03-2026 05:00 PM",
-            "Auction Date & Time": "11:00 AM - 01:00 PM"
-        }]
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine='openpyxl') as writer:
@@ -284,5 +280,4 @@ if start_btn:
             data=final_zip,
             file_name="Processed_Auctions.zip",
             mime="application/zip"
-                            )
-        
+        )
