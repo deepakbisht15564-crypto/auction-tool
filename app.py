@@ -4,10 +4,12 @@ import re
 import json
 import zipfile
 import io
-import base64
+import time
 import fitz
 import pandas as pd
-from groq import Groq
+from PIL import Image
+from google import genai
+from google.genai import types
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -16,19 +18,18 @@ st.set_page_config(
     layout="wide"
 )
 st.title("Bulk E-Auction PDF Processor")
-st.write("ExtractFox-Grade Vision Engine: Multi-Row Table Extraction.")
+st.write("Gemini 3.8 Flash Vision Engine: Multi-Account Extraction + Auto-Fit Styled Excel.")
 
-api_key = st.sidebar.text_input(
-    "Enter Groq API Key (starts with gsk_)",
-    type="password"
-)
+# Automatically fetch key from Streamlit Secrets or sidebar
+api_key = st.secrets.get("GEMINI_API_KEY")
+if not api_key:
+    api_key = st.sidebar.text_input("Enter Gemini API Key (starts with AIza)", type="password")
 
 uploaded_files = st.file_uploader(
     "Upload Auction PDFs (Bulk)",
     type=["pdf"],
     accept_multiple_files=True
 )
-start_btn = st.button("Start Processing")
 
 def clean_val(text):
     if not text:
@@ -43,13 +44,13 @@ def clean_prop(text):
     return re.sub(r'[^a-zA-Z0-9\s.,\-\/\(\)&:;]', ' ', c).strip()
 
 def format_borrower_name(raw_name):
-    if not raw_name or raw_name.upper() in ["N/A", "UNKNOWN", "NONE"]:
+    if not raw_name or str(raw_name).upper() in ["N/A", "UNKNOWN", "NONE", ""]:
         return "N/A"
     prefixes = [
         r'\bmr[.]?\s*mrs[.]?', r'\bmrmrs[.]?', r'\bmr[.]?', r'\bmrs[.]?',
         r'\bms[.]?', r'\bshri[.]?', r'\bsmt[.]?', r'\bm/s[.]?', r'\bdr[.]?'
     ]
-    cleaned = raw_name
+    cleaned = str(raw_name)
     for p in prefixes:
         cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'[^a-zA-Z\s.]', ' ', cleaned)
@@ -71,72 +72,50 @@ def clean_amount(val_str):
         return ""
     return cleaned
 
-def get_optimized_image_b64(page):
-    """
-    Renders notice at optimal resolution (< 1.5MB) to avoid 413 Payload Too Large error
-    """
-    pix_w, pix_h = page.rect.width, page.rect.height
-    clip_box = fitz.Rect(0, pix_h * 0.20, pix_w, pix_h * 0.98)
-    
-    # 130 DPI keeps image crisp while payload stays well below Groq 4MB limit
-    pix = page.get_pixmap(dpi=130, clip=clip_box)
-    img_bytes = pix.tobytes("jpeg")
-    return base64.b64encode(img_bytes).decode("utf-8")
-
-def extract_notices_with_groq_vision(groq_client, page):
-    b64_img = get_optimized_image_b64(page)
-
+def extract_notices_with_gemini(client, pil_image):
     prompt = """
-You are an expert legal data extraction engine. Analyze this newspaper auction notice table image.
+You are an expert financial auditor extracting Bank & ARC E-Auction Sale Notices from a scanned newspaper page.
 
 CRITICAL INSTRUCTIONS:
-1. Locate the multi-row table of auction properties/accounts (e.g. Arcil, Cholamandalam, etc.).
-2. EXTRACT EVERY ROW SEPARATELY. Do not skip any borrower or property.
-3. For EVERY account row, output a JSON object:
-   - bank_name: Name of Bank or ARC (e.g. Arcil, Cholamandalam).
-   - borrower_name: Primary borrower name in Title Case (no Mr/Mrs/Shri). Strip co-borrowers.
+1. Ignore general news, politics, articles, and non-auction advertisements.
+2. Locate every Bank / ARC E-Auction Sale Notice (e.g. Arcil, ICICI Bank, SBI, Canara Bank, HDFC, Cholamandalam, etc.).
+3. If there is a table containing multiple properties/borrowers/accounts, EXTRACT EVERY SINGLE ROW AS A SEPARATE OBJECT. Do not skip any row.
+4. For every account/property, return a JSON object:
+   - bank_name: Exact Name of Bank or ARC.
+   - borrower_name: Primary borrower ONLY in Title Case (strip Mr/Mrs/Shri). Exclude co-borrowers and guarantors.
    - property_description: Complete schedule of property (Survey No, Natham, Village, Area, Boundaries North/South/East/West).
-   - reserve_price: Pure numbers only (e.g. 1151688). No Rs symbol.
-   - emd_amount: Pure numbers only (e.g. 115169). No year numbers like 2026.
+   - reserve_price: Pure numerical amount (no Rs symbol).
+   - emd_amount: Pure numerical amount (do not capture years like 2026).
    - inspection_date_time: Inspection date/time or 'As per notice terms'.
-   - emd_last_date_time: Last date & time for EMD.
+   - emd_last_date_time: EMD submission deadline date & time.
    - auction_date_time: Date and time of auction.
 
 Return ONLY a pure valid JSON array of objects.
 """
-    try:
-        res = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_img}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            model="llama-3.2-11b-vision-preview",
-            temperature=0.0
-        )
-        raw = res.choices[0].message.content.strip()
-        if raw.startswith("```json"):
-            raw = raw[7:-3].strip()
-        elif raw.startswith("```"):
-            raw = raw[3:-3].strip()
-        data = json.loads(raw)
-        if isinstance(data, dict) and "notices" in data:
-            return data["notices"]
-        elif isinstance(data, list):
-            return data
-        return [data]
-    except Exception as e:
-        st.error(f"Vision API Warning: {str(e)}")
-        return []
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=[prompt, pil_image],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0
+                )
+            )
+            raw = resp.text.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:-3].strip()
+            elif raw.startswith("```"):
+                raw = raw[3:-3].strip()
+            data = json.loads(raw)
+            if isinstance(data, dict) and "notices" in data:
+                return data["notices"]
+            elif isinstance(data, list):
+                return data
+            return [data]
+        except Exception:
+            time.sleep(2)
+    return []
 
 def style_excel_worksheet(ws):
     header_font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
@@ -180,29 +159,41 @@ def style_excel_worksheet(ws):
     for col_letter, width in col_widths.items():
         ws.column_dimensions[col_letter].width = width
 
-def process_single_pdf(file_bytes, filename, groq_client):
+def process_single_pdf(file_bytes, filename, client):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    target_page = doc[0]
+    t_idx = 0
+    for idx in range(len(doc)):
+        txt = doc[idx].get_text().lower()
+        if any(w in txt for w in ["sale notice", "e-auction", "sarfaesi", "arcil", "reserve price"]):
+            t_idx = idx
+            break
 
+    target_page = doc[t_idx]
+
+    # Export full broadsheet page without clipping
     full_rect = target_page.rect
     target_page.set_cropbox(full_rect)
     target_page.set_mediabox(full_rect)
 
     full_doc = fitz.open()
-    full_doc.insert_pdf(doc, from_page=0, to_page=0)
+    full_doc.insert_pdf(doc, from_page=t_idx, to_page=t_idx)
     full_doc[0].set_cropbox(full_rect)
     full_doc[0].set_mediabox(full_rect)
     pdf_bytes = full_doc.write()
     full_doc.close()
 
-    extracted = extract_notices_with_groq_vision(groq_client, target_page)
+    # High-resolution rendering for multimodal vision
+    pix = target_page.get_pixmap(dpi=200)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
     doc.close()
+
+    extracted = extract_notices_with_gemini(client, img)
 
     bank_sheets = {}
     master_records = []
 
     for item in extracted:
-        raw_bank = clean_val(item.get("bank_name", "ARCIL")).upper()
+        raw_bank = clean_val(item.get("bank_name", "BANK NOTICE")).upper()
         clean_sheet = re.sub(r'[\\/*?:\[\]]', '', raw_bank)[:25].strip() or "NOTICE DATA"
 
         row_dict = {
@@ -218,13 +209,80 @@ def process_single_pdf(file_bytes, filename, groq_client):
         }
 
         bank_sheets.setdefault(clean_sheet, []).append(row_dict)
-
         m_row = dict(row_dict)
         m_row["Source_File"] = filename
         master_records.append(m_row)
 
-    # Bulletproof fallback so bank_sheets is never empty
     if not bank_sheets:
-        clean_fn = filename.replace("_Cutting", "").replace(".pdf", "").replace("-", " ")
-        tokens = [w for w in clean_fn.split() if not any(c.isdigit() for c in w)]
-        filter_words = ["THE", "NEW", "INDIAN", "EXPRESS", "TIMES", "DAINIK", "NOTICE", "E-AUCTION", "SALE", "AUCTION"]
+        bank_sheets["AUCTION NOTICE"] = [{
+            "S.No.": 1,
+            "Bank Name": "AUCTION NOTICE",
+            "Borrower(s) Name": "N/A",
+            "Property Description": "Refer attached full broadsheet page",
+            "Reserve Price": "",
+            "EMD Amount": "",
+            "Inspection Date & Time": "As per notice terms",
+            "EMD Last Date & Time": "",
+            "Auction Date & Time": ""
+        }]
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        for sheet_title, rows in bank_sheets.items():
+            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_title, index=False)
+            ws = writer.sheets[sheet_title]
+            style_excel_worksheet(ws)
+
+    excel_bytes = out.getvalue()
+    return pdf_bytes, excel_bytes, master_records
+
+if st.button("Start Processing", type="primary"):
+    if not api_key:
+        st.error("Gemini API Key missing! Please configure Streamlit Secrets or provide it in the sidebar.")
+    elif not uploaded_files:
+        st.warning("Please upload auction PDF files!")
+    else:
+        with st.spinner("Processing files with Gemini 3.8 Flash Vision..."):
+            client = genai.Client(api_key=api_key)
+            prog = st.progress(0)
+            status = st.empty()
+
+            zip_buf = io.BytesIO()
+            total = len(uploaded_files)
+            all_master = []
+
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for i, f in enumerate(uploaded_files):
+                    status.text(f"Processing ({i+1}/{total}): {f.name}")
+                    base = os.path.splitext(f.name)[0]
+
+                    p_pdf, x_data, m_rows = process_single_pdf(f.getvalue(), f.name, client)
+
+                    if p_pdf:
+                        zf.writestr(f"{base}_Complete_Page.pdf", p_pdf)
+                    if x_data:
+                        zf.writestr(f"{base}_Data.xlsx", x_data)
+                    if m_rows:
+                        all_master.extend(m_rows)
+
+                    prog.progress((i + 1) / total)
+
+                if all_master:
+                    m_df = pd.DataFrame(all_master)
+                    zf.writestr(
+                        "CRM_All_Accounts_Master.csv",
+                        m_df.to_csv(index=False).encode('utf-8')
+                    )
+
+            zip_buf.seek(0)
+            final_zip = zip_buf.getvalue()
+
+            status.success("Processing Complete!")
+            st.download_button(
+                label="📥 Download All Deliverables (ZIP)",
+                data=final_zip,
+                file_name="Processed_Auctions.zip",
+                mime="application/zip",
+                type="primary"
+        )
+            
