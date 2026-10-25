@@ -4,3 +4,6 @@ pandas
 openpyxl
 pillow
 google-genai
+playwright
+openpyxl
+pandas
