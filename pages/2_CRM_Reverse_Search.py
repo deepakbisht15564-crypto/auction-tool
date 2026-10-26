@@ -194,4 +194,7 @@ if uploaded_file:
     if st.button("Start Auto Search & Enrichment", type="primary"):
         prog = st.progress(0)
         status = st.empty()
-        enriched_df = run_
+        enriched_df = run_reverse_search(df_raw, prog, status)
+        styled_excel = generate_styled_excel(enriched_df)
+        st.success("Search Complete!")
+        st.download_button("Download Enriched Excel", styled_excel, "CRM_Search_Enriched.xlsx")
